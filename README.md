@@ -1,4 +1,4 @@
-# TOVChat
+# Tovchat
 
 A browser-based client for [TextOverVoice](https://github.com/SEKY443/CLI-TextOverVoice)
 (text transport over voice-grade audio channels — phone calls / VoIP), built

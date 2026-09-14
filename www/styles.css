@@ -32,6 +32,10 @@ button, input, textarea {
 
 /* ============================= gate ============================= */
 
+.gate[hidden] {
+  display: none;
+}
+
 .gate {
   position: fixed;
   inset: 0;
@@ -110,6 +114,10 @@ button, input, textarea {
 .gate-box .key.spacebar:hover { background: #191919; color: #f7f5ee; }
 
 /* ============================= layout ============================= */
+
+.screen[hidden] {
+  display: none;
+}
 
 .screen {
   height: 100vh;
