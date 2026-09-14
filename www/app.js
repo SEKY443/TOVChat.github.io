@@ -122,6 +122,24 @@ const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak 
 const CARRIER_SENSE_BUSY_THRESHOLD = 0.06; // normalized peak amplitude considered "channel busy" (~-24dBFS)
 const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks
 const CARRIER_SENSE_MAX_WAIT_MS = 4000; // give up waiting and transmit anyway after this long
+// Found live with more than two listening devices: several receivers can
+// finish decoding the SAME broadcast frame at essentially the same instant
+// and each independently send its ack back. Every one of them checks the
+// channel, finds it already clear (nobody else has keyed up yet), and --
+// without this -- the old fast path returned immediately with no delay at
+// all, so all of them transmitted in the same instant anyway. A busy-wait
+// alone can't catch this: it only ever defers when it *already* detects
+// energy on the channel, but at the moment every ack-sender checks, the
+// channel genuinely is still idle -- the collision hasn't happened yet.
+// Real CSMA/CA (802.11 DCF) doesn't skip contention just because the
+// channel is idle either, for exactly this reason: it always makes a
+// station wait a random backoff before transmitting, idle or not, so
+// multiple stations ready at the same moment don't all fire on the first
+// idle instant they see. This mirrors that -- a short mandatory random
+// jitter before every transmission, re-checking the channel afterward in
+// case someone else keyed up during the wait.
+const CARRIER_SENSE_JITTER_MIN_MS = 40;
+const CARRIER_SENSE_JITTER_MAX_MS = 300;
 
 // Exact reason strings protocol.rs reports when a frame ran out of REAL
 // captured audio partway through reading it -- not corruption, just "the
@@ -1261,25 +1279,46 @@ function updateMicLevelDisplay(peak) {
   currentMicPeak = peak;
 }
 
-/// Waits for the channel to sound quiet before a transmission starts --
-/// see the CARRIER_SENSE_* constants for why. A device that isn't
+/// Waits for the channel to sound quiet before a transmission starts, then
+/// makes it wait a short random jitter on top and re-checks -- see the
+/// CARRIER_SENSE_* constants for why the jitter applies even on an
+/// already-clear channel, not just a busy one. A device that isn't
 /// listening has no mic level to check and returns immediately (transmits
 /// blind, same as before this existed).
 async function waitForClearChannel() {
-  if (!listening || currentMicPeak <= CARRIER_SENSE_BUSY_THRESHOLD) return; // common case: already clear
-  dbg("carrier-busy", "peak=" + currentMicPeak.toFixed(3), "waiting before transmit");
+  if (!listening) return;
   const previousStatus = carriageStatus.textContent;
   const deadline = performance.now() + CARRIER_SENSE_MAX_WAIT_MS;
   let waited = 0;
-  while (currentMicPeak > CARRIER_SENSE_BUSY_THRESHOLD && performance.now() < deadline) {
-    setCarriageStatus("● CHANNEL BUSY, WAITING…");
-    const backoff = CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS;
-    waited += backoff;
-    await sleep(backoff);
+  let announcedBusy = false;
+  while (performance.now() < deadline) {
+    if (currentMicPeak > CARRIER_SENSE_BUSY_THRESHOLD) {
+      if (!announcedBusy) {
+        dbg("carrier-busy", "peak=" + currentMicPeak.toFixed(3), "waiting before transmit");
+        announcedBusy = true;
+      }
+      setCarriageStatus("● CHANNEL BUSY, WAITING…");
+      const backoff = CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS;
+      waited += backoff;
+      await sleep(backoff);
+      continue;
+    }
+    // Channel reads clear -- still owe a mandatory random contention
+    // jitter before actually transmitting (see the constants' comment),
+    // then re-check: if someone else keyed up while this device was
+    // jittering, loop back into the busy branch instead of transmitting
+    // over them.
+    const jitter = CARRIER_SENSE_JITTER_MIN_MS + Math.random() * (CARRIER_SENSE_JITTER_MAX_MS - CARRIER_SENSE_JITTER_MIN_MS);
+    waited += jitter;
+    await sleep(jitter);
+    if (currentMicPeak <= CARRIER_SENSE_BUSY_THRESHOLD) {
+      dbg("carrier-clear", "channel clear after", Math.round(waited) + "ms");
+      setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
+      return;
+    }
   }
-  const timedOut = performance.now() >= deadline;
-  dbg("carrier-clear", timedOut ? "gave up waiting after" : "channel clear after", Math.round(waited) + "ms");
-  setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
+  dbg("carrier-clear", "gave up waiting after", Math.round(waited) + "ms");
+  setCarriageStatus(previousStatus);
 }
 
 async function startCapture(onPoll) {

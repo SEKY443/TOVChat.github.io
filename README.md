@@ -310,6 +310,23 @@ typewriter-key-styled controls.
     isn't listening has no mic level to check and transmits blind, same
     as always.
 
+    **Also found live, with more than two listening devices**: several
+    receivers can finish decoding the *same* broadcast frame at
+    essentially the same instant and each independently send its ack back
+    — and the busy-wait above didn't stop them from colliding, because it
+    only ever defers when it *already* detects energy on the channel: at
+    the moment every ack-sender checks, the channel genuinely is still
+    idle, so the old fast path returned immediately with no delay at all
+    and all of them transmitted in the same instant anyway. Real CSMA/CA
+    (802.11 DCF) doesn't skip contention just because the channel is idle
+    either, for exactly this reason — it always makes a station wait a
+    random backoff before transmitting, idle or not. `waitForClearChannel`
+    now does the same: even once the channel reads clear, it waits a
+    short mandatory random jitter and re-checks before actually
+    transmitting, looping back into the busy-wait if someone else keyed up
+    during that jitter — so multiple devices all finding the channel idle
+    at the same moment get staggered instead of firing together.
+
     **Also found live**: replying quickly still sometimes rang the bell
     twice for what was clearly one message. Cause: `RETRY_ACK_GRACE_MS`
     (6s) was tight enough that a completely successful delivery could
