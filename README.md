@@ -110,6 +110,31 @@ typewriter-key-styled controls.
     (Node can confirm the receiver still decodes correctly with the added
     silence, which it does, but not whether it actually fixes real
     hardware timing — that needs another live test).
+
+    **Fifth round**: after the tab-contamination bug (below) was fixed and
+    testing resumed, `HEADER FEC: UNCORRECTABLE` remained the dominant
+    failure most of the time. Root cause found by reading the wire format
+    rather than more live trial and error:
+    [`textovervoice-core`](https://github.com/SEKY443/textovervoice-core)'s
+    `ProtectedHeader` format protects its 6-byte header with a *fixed* RS
+    budget (`HEADER_PARITY_BYTES = 4`, correcting only 2 corrupted bytes)
+    that never changes, while Calibrate mode's whole reason to exist is
+    finding a payload `parity_bytes` (10/20/40) that survives this
+    specific noisy channel. That meant Calibrate could hand back a payload
+    setting well-protected enough to survive the channel, but the header
+    riding in front of it stayed stuck at t=2 regardless — so on exactly
+    the noisy channels Calibrate exists for, the header became the
+    bottleneck and failed before the payload's own (now well-protected)
+    FEC was ever exercised. Fixed at the core: raised `HEADER_PARITY_BYTES`
+    (and the equivalent `NACK_PARITY_BYTES`) from 4 to 12, t=2 to t=6 — the
+    header is only 6 bytes, so even a generous budget costs a handful of
+    wire bytes per frame. `textovervoice-core`'s 117-test suite (widened
+    two corruption-budget tests to still exceed the new, larger budget)
+    confirms the stronger header still round-trips cleanly and still fails
+    cleanly — never silently wrong — beyond it. This one is fully proven
+    at the protocol level, not a live-only hypothesis — but like every
+    wire-format change in this project, it still needs a real acoustic
+    retest to confirm it actually moves the needle on real hardware.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is
