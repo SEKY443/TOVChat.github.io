@@ -361,7 +361,8 @@ let audioCtx = null;
 let listening = false;
 let mediaStream = null;
 let workletNode = null;
-let captureChunks = [];
+let captureBuffer = new Float32Array(0); // see appendCaptureChunk -- grows in place, never rebuilt from scratch
+let captureLength = 0; // how much of captureBuffer actually holds real samples
 let captureSampleRate = SR;
 let scanPos = { phone: 0, fast_air: 0 };
 let scanStuckSince = { phone: null, fast_air: null }; // Date.now() a truncation-looking retry started, per mode
@@ -756,6 +757,23 @@ async function sendMessage() {
   const raw = textInput.value;
   if (raw.trim().length === 0) return;
 
+  // Delivery tracking (the ack/retry cycle below) is worthless without the
+  // mic actually running: an ack is just another incoming frame, and
+  // nothing decodes incoming frames unless `listening` is on and
+  // `pollCapture` is polling. Found live: send a message without ever
+  // having clicked LISTEN, and it sits "AWAITING ACK" forever no matter
+  // how cleanly the other side actually received and acked it -- this
+  // device was never listening for the answer. Starting capture here,
+  // automatically, closes that gap: sending a message now means "listen
+  // for the reply" the same way it would for any real conversation,
+  // instead of requiring a separate manual step the UI never explained
+  // was necessary. A no-op if already listening; silently does nothing
+  // (falls through to send anyway) if the mic is unavailable/denied --
+  // no worse than the behavior before this existed.
+  if (maxRetries > 0 && !listening) {
+    await startListening();
+  }
+
   const id = randomMsgId();
   const textChunks = chunkText(raw, CHUNK_TEXT_CHARS);
   const taggedChunks = textChunks.map((c) => tagChunk(id, username, c));
@@ -923,16 +941,31 @@ retryCountInput.addEventListener("change", () => {
 
 // ============================= receive: live mic =============================
 
-function materializeCaptureBuffer() {
-  let total = 0;
-  for (const c of captureChunks) total += c.length;
-  const merged = new Float32Array(total);
-  let off = 0;
-  for (const c of captureChunks) {
-    merged.set(c, off);
-    off += c.length;
+/// Appends `chunk` onto `captureBuffer`, growing it (by doubling) only when
+/// it's actually out of room, and returns a zero-copy view of everything
+/// captured so far. Replaces the previous design, which kept every
+/// worklet chunk in an array and re-concatenated the WHOLE thing into a
+/// fresh Float32Array on every single poll tick -- O(already-captured
+/// length) work, every 1.2s, for the entire lifetime of a listening
+/// session, at the browser's native sample rate (44.1-48kHz, not the
+/// modem's 8kHz) -- up to MAX_BUFFER_SECONDS worth, so a buffer nearing
+/// that cap was being fully re-copied (roughly 2 million samples) on
+/// every poll for no reason: almost none of it had changed since the
+/// last poll. Appending in place and handing out a `subarray` (a view
+/// into the same backing memory, not a copy) makes each poll's cost
+/// proportional to what's NEW since last time, not to everything
+/// captured so far.
+function appendCaptureChunk(chunk) {
+  if (captureLength + chunk.length > captureBuffer.length) {
+    let newCap = captureBuffer.length * 2 || chunk.length;
+    while (newCap < captureLength + chunk.length) newCap *= 2;
+    const grown = new Float32Array(newCap);
+    grown.set(captureBuffer.subarray(0, captureLength));
+    captureBuffer = grown;
   }
-  return merged;
+  captureBuffer.set(chunk, captureLength);
+  captureLength += chunk.length;
+  return captureBuffer.subarray(0, captureLength);
 }
 
 /// Scales the whole buffer up so its peak reaches NORMALIZE_TARGET_PEAK,
@@ -1166,7 +1199,7 @@ function handleDecodedFrame(frame, mode, frameDurationMs) {
 }
 
 function resetCaptureBuffer() {
-  captureChunks = [];
+  captureLength = 0; // keep the allocated capacity -- no need to reallocate on next use
   scanPos = { phone: 0, fast_air: 0 };
   scanStuckSince = { phone: null, fast_air: null };
 }
@@ -1341,7 +1374,8 @@ async function startCapture(onPoll) {
   const ctx = await ensureAudioContext();
   await ctx.audioWorklet.addModule("./capture-worklet.js");
   captureSampleRate = ctx.sampleRate;
-  captureChunks = [];
+  captureBuffer = new Float32Array(0);
+  captureLength = 0;
   resetMicLevel();
 
   let meterPeak = 0;
@@ -1350,7 +1384,7 @@ async function startCapture(onPoll) {
   workletNode = new AudioWorkletNode(ctx, "capture-processor");
   workletNode.port.onmessage = (e) => {
     if (performance.now() < suppressCaptureUntil) return; // ignore our own transmission -- see playPcm
-    captureChunks.push(e.data);
+    appendCaptureChunk(e.data);
     for (const v of e.data) {
       const a = Math.abs(v);
       if (a > meterPeak) meterPeak = a;
@@ -1365,22 +1399,22 @@ async function startCapture(onPoll) {
   source.connect(workletNode);
 
   pollTimer = setInterval(() => {
-    if (captureChunks.length === 0) return;
-    const buffer = materializeCaptureBuffer();
-    if (buffer.length > MAX_BUFFER_SECONDS * captureSampleRate) {
+    if (captureLength === 0) return;
+    if (captureLength > MAX_BUFFER_SECONDS * captureSampleRate) {
       // Reset every position-tracker this shared capture loop could be
-      // feeding (normal listening's, calibrate-listen's), not just
-      // captureChunks -- whichever one is currently active, leaving its
-      // scan position stale relative to the now-empty buffer reproduces
-      // the exact bug this is fixing, just for that mode instead.
-      captureChunks = [];
+      // feeding (normal listening's, calibrate-listen's), not just the
+      // capture buffer itself -- whichever one is currently active,
+      // leaving its scan position stale relative to the now-empty buffer
+      // reproduces the exact bug this is fixing, just for that mode
+      // instead.
+      captureLength = 0;
       scanPos = { phone: 0, fast_air: 0 };
       scanStuckSince = { phone: null, fast_air: null };
       calibrateScanPos = new Map();
       calibrateStuckSince = new Map();
       return;
     }
-    onPoll(normalizePeak(buffer));
+    onPoll(normalizePeak(captureBuffer.subarray(0, captureLength)));
   }, POLL_INTERVAL_MS);
 }
 
@@ -1391,7 +1425,7 @@ function stopCapture() {
   if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
   workletNode = null;
   mediaStream = null;
-  captureChunks = [];
+  captureLength = 0;
   resetMicLevel();
 }
 

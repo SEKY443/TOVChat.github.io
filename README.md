@@ -426,6 +426,31 @@ typewriter-key-styled controls.
   this layer doesn't have visibility into) — a plausible-looking flicker
   in service of the effect, not a debugging tool.
 
+- **Sending required the mic to already be on, found live**: delivery
+  tracking (the ack/retry cycle every send with `maxRetries > 0` enters)
+  is useless without the mic actually running — an ack is just another
+  incoming frame, and nothing decodes incoming frames unless `listening`
+  is on and `pollCapture` is polling. A message sent without ever having
+  clicked LISTEN sat "AWAITING ACK" forever no matter how cleanly the
+  other side received and acked it, since this device was never listening
+  for the answer — a UI gap the app never explained. `sendMessage` now
+  starts listening automatically (same as clicking LISTEN) before it
+  hands a message off to delivery tracking, if it isn't listening
+  already; falls through and sends anyway if the mic is
+  unavailable/denied, same as before this existed.
+- **Capture buffer performance**: every poll tick re-concatenated the
+  *entire* captured-so-far buffer from scratch into a fresh
+  `Float32Array` — O(already-captured length) work, every 1.2s, for the
+  whole lifetime of a listening session, at the browser's native sample
+  rate (44.1–48kHz, not the modem's 8kHz), up to `MAX_BUFFER_SECONDS`
+  worth — a buffer nearing that cap was being fully re-copied (roughly 2
+  million samples) on every poll for no reason, since almost none of it
+  had changed since the last one. Replaced with a persistent buffer that
+  grows in place (doubling capacity only when it actually runs out of
+  room) and hands each poll a zero-copy `subarray` view of what's been
+  captured so far — poll cost now scales with what's new since last time,
+  not with everything captured since LISTEN was turned on.
+
 Verified live against the deployed site in a real browser (Chrome):
 username gate, send (real speaker playback, history rendering), local
 resend, mode toggle, and file-based decode (uploaded a real generated
