@@ -898,9 +898,14 @@ function normalizePeak(buffer) {
 // failure -- not just the final assembled message.
 
 function steadyLiveDecodeStatus() {
-  return liveDecodeId
-    ? `● RECEIVING · ${liveDecodeUsername} · #${liveDecodeId}  [FEC ✓] [CRC ✓]`
-    : "▪ AWAITING SIGNAL ▪";
+  // Deliberately no "[FEC ✓] [CRC ✓]" here -- by the time this frame's text
+  // reaches JS at all, the wasm side has already fully verified both (it
+  // can't hand back partially-checked data), so claiming that here, before
+  // the reveal has even started, was true but misleadingly early -- the
+  // user watching the flicker resolve hasn't "seen" it happen yet. The
+  // confirmation belongs at the end of the decode progress, once the
+  // reveal actually catches up -- see onLiveMessageComplete.
+  return liveDecodeId ? `● RECEIVING · ${liveDecodeUsername} · #${liveDecodeId}` : "▪ AWAITING SIGNAL ▪";
 }
 
 function setLiveDecodeStatus(text) {
@@ -945,15 +950,26 @@ function hideLiveDecode() {
   clearTimeout(liveDecodeStatusRestoreTimer);
 }
 
-async function typewriterReveal(fullText, startAt) {
+// `onDone`, if given, only runs once the reveal actually reaches the end
+// of `fullText` (not if a newer reveal supersedes this one first) -- lets
+// a caller show "message complete" exactly when the visual decode process
+// the user is watching genuinely finishes, instead of the instant the
+// underlying frame decoded (found live: that used to fire a fixed
+// LIVE_DECODE_COMPLETE_HOLD_MS timer immediately on decode, which -- once
+// the per-character flicker made a full reveal take several seconds for
+// anything but a short message -- reliably wiped the box's text via
+// resetLiveDecode() while the reveal was still mid-flicker, looking like
+// the animation had simply stopped partway through).
+async function typewriterReveal(fullText, startAt, onDone) {
   const token = ++liveDecodeRevealToken;
   for (let i = startAt; i < fullText.length; i++) {
     if (token !== liveDecodeRevealToken) return; // superseded by a newer reveal
     await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i]);
   }
+  if (token === liveDecodeRevealToken && onDone) onDone();
 }
 
-function onLiveFrame(frame) {
+function onLiveFrame(frame, onRevealDone) {
   if (liveDecodeEl.hidden) return;
   if (frame.ok) {
     const tag = untagChunk(frame.text);
@@ -968,23 +984,38 @@ function onLiveFrame(frame) {
     setLiveDecodeStatus(steadyLiveDecodeStatus());
     const startAt = liveDecodeRevealed.length;
     liveDecodeRevealed += tag.text;
-    typewriterReveal(liveDecodeRevealed, startAt);
+    typewriterReveal(liveDecodeRevealed, startAt, onRevealDone);
   } else if (MEANINGFUL_FAILURES.has(frame.reason)) {
     flashLiveDecodeStatus(`✕ ${MEANINGFUL_FAILURES.get(frame.reason)}`);
   }
 }
 
 function onLiveMessageComplete() {
-  setTransientLiveDecodeStatus("✓ MESSAGE COMPLETE", LIVE_DECODE_COMPLETE_HOLD_MS, resetLiveDecode);
+  // This is where the FEC/CRC confirmation belongs (see
+  // steadyLiveDecodeStatus) -- both are already known good by now (this
+  // only runs once the reveal itself has finished), so showing it here
+  // lines the checkmarks up with the moment the user actually finishes
+  // watching the text resolve, not the instant the frame decoded.
+  setTransientLiveDecodeStatus("✓ FEC OK · ✓ CRC OK · MESSAGE COMPLETE", LIVE_DECODE_COMPLETE_HOLD_MS, resetLiveDecode);
 }
 
 function handleDecodedFrame(frame, mode) {
-  onLiveFrame(frame);
-  if (!frame.ok) return;
+  if (!frame.ok) {
+    onLiveFrame(frame);
+    return;
+  }
   const tag = untagChunk(frame.text);
   if (!tag) return; // not one of ours (or a corrupted envelope) -- ignore, don't guess
 
   const result = liveReassembler.add(tag.id, tag.username, frame.seq, tag.text, frame.more_frames);
+  // A resend the sender only sent because it never heard our first ack
+  // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
+  // identical to a genuinely new message here -- same id, same content,
+  // decoded clean. Computed before onLiveFrame so the "message complete"
+  // callback can be skipped for a duplicate the same way ringBell already
+  // is, below.
+  const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
+  onLiveFrame(frame, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined);
   if (result.ok) {
     const updated = updateHistoryEntry(tag.id, "rx", {
       status: "received",
@@ -1006,18 +1037,11 @@ function handleDecodedFrame(frame, mode) {
         framesExpected: result.framesExpected,
       });
     }
-    // A resend the sender only sent because it never heard our first ack
-    // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
-    // identical to a genuinely new message here -- same id, same content,
-    // decoded clean. Re-send the ack regardless (that's the whole point:
-    // the sender is still waiting), but don't re-announce something the
-    // user already saw arrive once.
-    const alreadyReceived = receivedMessageIds.has(tag.id);
+    // Re-send the ack regardless of alreadyReceived (that's the whole
+    // point: the sender is still waiting), but don't re-ring the bell for
+    // something the user already saw arrive once.
     receivedMessageIds.add(tag.id);
-    if (!alreadyReceived) {
-      onLiveMessageComplete();
-      ringBell();
-    }
+    if (!alreadyReceived) ringBell();
     sendAckFor(tag.id, mode); // fire-and-forget -- see sendAckFor
     // The buffer is never trimmed as it's consumed (only ever grows, up
     // to the hard MAX_BUFFER_SECONDS cap), so without this a long

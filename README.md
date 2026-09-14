@@ -218,6 +218,29 @@ typewriter-key-styled controls.
     found and fixed a real race live-testing this: two separate timers
     let a completion's reset fire mid-flash and cut a later failure
     notice short.
+
+    **Found live, again, after adding the binary-flicker decode
+    animation**: the readout would reliably go blank partway through any
+    message longer than a few characters, looking like it had just
+    stopped. Cause: `onLiveMessageComplete` fired (and started its
+    `LIVE_DECODE_COMPLETE_HOLD_MS` reset timer) the *instant* the
+    underlying frame decoded, not once the on-screen reveal actually
+    caught up to it -- fine when the reveal was a fast plain typewriter,
+    but once the flicker made a full reveal take several seconds for
+    anything but a short message, the 2s hold routinely elapsed and
+    wiped the box (`resetLiveDecode`) while the animation was still
+    mid-flicker. Fixed by chaining the completion callback onto the
+    reveal's own end (`typewriterReveal`'s `onDone`, only invoked once
+    the loop reaches the real end of the text, not when superseded by a
+    newer one) instead of firing it independently. The FEC/CRC
+    confirmation moved with it: showing `[FEC ✓] [CRC ✓]` the moment a
+    frame decoded was technically true (the wasm side can't hand back a
+    frame that hasn't already fully passed both) but misleadingly early
+    against what the user watching the reveal has actually seen happen
+    yet — the checkmarks now appear together with "MESSAGE COMPLETE"
+    only once the reveal itself finishes, so the readout tells one
+    coherent story end to end: raw bits flickering into letters, then,
+    once the text is fully there, the verification it already passed.
   - **Mic level meter**, alongside the readout: a live peak-amplitude bar
     + dB readout, redrawn from every captured audio chunk. Added after
     live acoustic testing on real hardware where the send/receive
