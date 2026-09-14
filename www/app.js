@@ -1125,6 +1125,36 @@ fileInput.addEventListener("change", async (ev) => {
 
 // ============================= init =============================
 
+// TEMPORARY diagnostic hook (remove once the HEADER FEC investigation is
+// done): exposes the raw live-capture buffer for offline analysis against
+// the compiled core -- console.error, not .log, so it survives whatever
+// log-level filter is active.
+window.__tovDiag = {
+  dumpCapture() {
+    const total = captureChunks.reduce((n, c) => n + c.length, 0);
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of captureChunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    const i16 = new Int16Array(merged.length);
+    for (let i = 0; i < merged.length; i++) {
+      const s = Math.max(-1, Math.min(1, merged[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const bytes = new Uint8Array(i16.buffer);
+    let bin = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return { sampleRate: captureSampleRate, samples: merged.length, base64: btoa(bin) };
+  },
+};
+
+// ============================= init =============================
+
 async function main() {
   try {
     await init();
