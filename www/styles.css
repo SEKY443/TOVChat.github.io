@@ -379,13 +379,20 @@ button, input, textarea {
   gap: 5px;
 }
 .retry-config input {
-  width: 2.6em;
+  width: 3em;
   background: transparent;
   border: 1px solid #7a756c;
   color: #f7f5ee;
   font-family: inherit;
   font-size: 9px;
   padding: 2px 3px;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.retry-config input::-webkit-outer-spin-button,
+.retry-config input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .footnote { font-size: 9px; letter-spacing: 1.5px; color: #7a756c; }
