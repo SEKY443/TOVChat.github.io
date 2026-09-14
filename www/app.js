@@ -81,17 +81,30 @@ const MEANINGFUL_FAILURES = new Map([
   ["protected header FEC uncorrectable", "HEADER FEC: UNCORRECTABLE"],
   ["frame is encrypted but no session key was provided", "ENCRYPTED — NO KEY TO DECRYPT"],
 ]);
-const TYPEWRITER_CHAR_MS = 18;
+const TYPEWRITER_CHAR_MS = 14;
 // Per-character "decode" flicker -- raw guessed bits settling into the
 // real 8-bit code, then resolving into the actual letter -- shown before
 // a character locks in, in both the live-decode preview box and a chat
 // bubble's reveal. Skipped for whitespace (nothing interesting to flicker
-// through, and skipping keeps word-boundary pacing snappy).
-const DECODE_BINARY_FLICKER_FRAMES = 2; // scrambled guesses before the real bits show
-const DECODE_BINARY_HOLD_MS = 35; // how long each scrambled/real-bits frame holds
-const DECODE_BITS_HOLD_MS = 55; // how long the real 8-bit code holds before resolving to the letter
+// through, and skipping keeps word-boundary pacing snappy). Each call
+// gets a `budgetMs` (see flickerInChar) -- the chat bubble uses a fixed
+// default, but the live-decode box derives it from how long the frame
+// actually took to arrive (see LIVE_REVEAL_MIN/MAX_CHAR_MS below), so the
+// reveal genuinely tracks the real transmission instead of an arbitrary
+// canned animation, and stays fast for anything but a very short frame.
+const FLICKER_DEFAULT_BUDGET_MS = 55; // chat-bubble reveal, no real-time duration to derive from
+const FLICKER_SKIP_THRESHOLD_MS = 16; // below this, no time to show anything but the resolved char
+const FLICKER_BITS_ONLY_THRESHOLD_MS = 40; // below this, skip the scrambled-guess phase, go straight to real bits
 const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
+// The live-decode box's reveal pace is derived per frame from how long
+// that frame actually took to arrive over the (real or simulated) air
+// (see pollCapture's frameDurationMs and typewriterReveal) -- these just
+// bound the per-character result so a frame with very few characters
+// over a long duration doesn't crawl, and a frame packed with characters
+// over a short duration doesn't blur past unreadable.
+const LIVE_REVEAL_MIN_CHAR_MS = 10;
+const LIVE_REVEAL_MAX_CHAR_MS = 70;
 const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
@@ -469,25 +482,43 @@ function charBits(ch) {
 }
 
 /// Reveals one more character onto `prefix` via `setText` (a callback
-/// given the full text-so-far) -- for a non-whitespace character, a few
-/// scrambled 8-bit guesses, then the real 8-bit code, then the resolved
-/// letter; whitespace just appears, no flicker. Shared by
-/// `animateEntryReveal` (a chat bubble) and `typewriterReveal` (the
-/// live-decode preview box) so the two reveals look and feel the same.
-async function flickerInChar(setText, prefix, ch) {
+/// given the full text-so-far) within `budgetMs` total -- for a
+/// non-whitespace character, a scrambled 8-bit guess settling into the
+/// real 8-bit code then the resolved letter, each phase getting a slice
+/// of the budget; whitespace just appears, no flicker. Shared by
+/// `animateEntryReveal` (a chat bubble, fixed budget) and
+/// `typewriterReveal` (the live-decode preview box, budget derived from
+/// the frame's real over-the-air duration) so both reveals look and feel
+/// the same, just paced differently. A tight budget (a long real message
+/// packed into a short transmission) degrades gracefully: skip the
+/// scrambled-guess phase first, then skip straight to the resolved
+/// character -- staying fast and legible instead of stretching the
+/// animation past what the budget actually allows.
+async function flickerInChar(setText, prefix, ch, budgetMs = FLICKER_DEFAULT_BUDGET_MS) {
   if (ch.trim() === "") {
     setText(prefix + ch);
-    await sleep(TYPEWRITER_CHAR_MS);
+    await sleep(Math.min(budgetMs, TYPEWRITER_CHAR_MS));
     return;
   }
-  for (let f = 0; f < DECODE_BINARY_FLICKER_FRAMES; f++) {
-    const scrambled = Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
-    setText(prefix + scrambled);
-    await sleep(DECODE_BINARY_HOLD_MS);
+  if (budgetMs < FLICKER_SKIP_THRESHOLD_MS) {
+    setText(prefix + ch);
+    await sleep(budgetMs);
+    return;
   }
+  if (budgetMs < FLICKER_BITS_ONLY_THRESHOLD_MS) {
+    setText(prefix + charBits(ch));
+    await sleep(budgetMs * 0.5);
+    setText(prefix + ch);
+    await sleep(budgetMs * 0.5);
+    return;
+  }
+  const scrambled = Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
+  setText(prefix + scrambled);
+  await sleep(budgetMs * 0.3);
   setText(prefix + charBits(ch));
-  await sleep(DECODE_BITS_HOLD_MS);
+  await sleep(budgetMs * 0.3);
   setText(prefix + ch);
+  await sleep(budgetMs * 0.4);
 }
 
 /// Reveals `fullText` into `el` one character at a time (via
@@ -980,16 +1011,26 @@ function hideLiveDecode() {
 // anything but a short message -- reliably wiped the box's text via
 // resetLiveDecode() while the reveal was still mid-flicker, looking like
 // the animation had simply stopped partway through).
-async function typewriterReveal(fullText, startAt, onDone) {
+async function typewriterReveal(fullText, startAt, onDone, frameDurationMs = 0) {
   const token = ++liveDecodeRevealToken;
   const startedAt = performance.now();
-  dbg("reveal-start", `${startAt}->${fullText.length} chars`, "token=" + token);
+  const newChars = fullText.length - startAt;
+  // The frame's own real over-the-air duration (measured from actual
+  // sample positions in pollCapture, not guessed) spread across just the
+  // characters this frame added -- so a message that took 900ms to
+  // actually transmit reveals over roughly 900ms, and a long message
+  // packed into a short frame reveals fast rather than dragging out a
+  // fixed per-char delay well past when the real decode finished.
+  const perCharMs = newChars > 0
+    ? Math.min(LIVE_REVEAL_MAX_CHAR_MS, Math.max(LIVE_REVEAL_MIN_CHAR_MS, frameDurationMs / newChars))
+    : LIVE_REVEAL_MIN_CHAR_MS;
+  dbg("reveal-start", `${startAt}->${fullText.length} chars`, "token=" + token, "frameMs=" + Math.round(frameDurationMs), "perChar=" + perCharMs.toFixed(1) + "ms");
   for (let i = startAt; i < fullText.length; i++) {
     if (token !== liveDecodeRevealToken) {
       dbg("reveal-superseded", "token=" + token, "at char", i, "of", fullText.length);
       return;
     }
-    await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i]);
+    await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i], perCharMs);
   }
   if (token === liveDecodeRevealToken) {
     dbg("reveal-done", "token=" + token, Math.round(performance.now() - startedAt) + "ms");
@@ -997,7 +1038,7 @@ async function typewriterReveal(fullText, startAt, onDone) {
   }
 }
 
-function onLiveFrame(frame, onRevealDone) {
+function onLiveFrame(frame, onRevealDone, frameDurationMs) {
   if (liveDecodeEl.hidden) return;
   if (frame.ok) {
     const tag = untagChunk(frame.text);
@@ -1012,7 +1053,7 @@ function onLiveFrame(frame, onRevealDone) {
     setLiveDecodeStatus(steadyLiveDecodeStatus());
     const startAt = liveDecodeRevealed.length;
     liveDecodeRevealed += tag.text;
-    typewriterReveal(liveDecodeRevealed, startAt, onRevealDone);
+    typewriterReveal(liveDecodeRevealed, startAt, onRevealDone, frameDurationMs);
   } else if (MEANINGFUL_FAILURES.has(frame.reason)) {
     flashLiveDecodeStatus(`✕ ${MEANINGFUL_FAILURES.get(frame.reason)}`);
   }
@@ -1027,9 +1068,9 @@ function onLiveMessageComplete() {
   setTransientLiveDecodeStatus("✓ FEC OK · ✓ CRC OK · MESSAGE COMPLETE", LIVE_DECODE_COMPLETE_HOLD_MS, resetLiveDecode);
 }
 
-function handleDecodedFrame(frame, mode) {
+function handleDecodedFrame(frame, mode, frameDurationMs) {
   if (!frame.ok) {
-    onLiveFrame(frame);
+    onLiveFrame(frame, undefined, frameDurationMs);
     return;
   }
   const tag = untagChunk(frame.text);
@@ -1043,7 +1084,7 @@ function handleDecodedFrame(frame, mode) {
   // callback can be skipped for a duplicate the same way ringBell already
   // is, below.
   const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
-  onLiveFrame(frame, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined);
+  onLiveFrame(frame, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined, frameDurationMs);
   if (result.ok) {
     dbg("complete", tag.id, alreadyReceived ? "(duplicate resend)" : "(new)", JSON.stringify(result.text.slice(0, 60)));
     const updated = updateHistoryEntry(tag.id, "rx", {
@@ -1129,6 +1170,11 @@ async function pollCapture(buffer) {
       if (!frame) break;
 
       dbg("scan", mode, "pos=" + pos, "ok=" + frame.ok, frame.ok ? "" : frame.reason, "next=" + frame.next_start);
+      // The frame's real span in the actual captured audio -- how long it
+      // genuinely took to arrive, preamble through CRC -- not an estimate.
+      // Feeds the live-decode reveal's pacing (see typewriterReveal) so it
+      // tracks the real transmission instead of an arbitrary fixed timer.
+      const frameDurationMs = ((frame.next_start - pos) / captureSampleRate) * 1000;
 
       if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
         if (scanStuckSince[mode] === null) scanStuckSince[mode] = Date.now();
@@ -1146,7 +1192,7 @@ async function pollCapture(buffer) {
         scanStuckSince[mode] = null;
       }
 
-      if (handleDecodedFrame(frame, mode)) return; // buffer was reset on completion -- stop, buffer/pos are gone
+      if (handleDecodedFrame(frame, mode, frameDurationMs)) return; // buffer was reset on completion -- stop, buffer/pos are gone
       pos = frame.next_start;
     }
     scanPos[mode] = pos;
