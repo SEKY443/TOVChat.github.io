@@ -56,6 +56,32 @@ const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how ofte
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
 
+// Exact reason strings protocol.rs reports when a frame ran out of REAL
+// captured audio partway through reading it -- not corruption, just "the
+// rest of this transmission hasn't arrived in the buffer yet" (confirmed
+// directly: scanning a deliberately-truncated encode of a real message
+// reproduces these exact strings, never seen on complete data). Live
+// polling scans a buffer that's still GROWING while a transmission is in
+// flight, unlike a fully-captured file, so this is routine, not rare --
+// and the old code treated it exactly like real corruption, permanently
+// skipping past the position via next_start before the rest of the
+// message ever arrived. "protected header FEC uncorrectable" and the
+// Legacy marker-not-found reasons are ambiguous (could also be genuine
+// correction failure on already-complete data), but truncation is the
+// far more likely explanation while a live poll is still filling in --
+// TRUNCATION_RETRY_TIMEOUT_MS is the safety net for the case where it
+// really was just corrupted.
+const TRUNCATION_REASONS = new Set([
+  "unexpected end of frame",
+  "payload extends past end of received data",
+  "unexpected end of frame reading parity",
+  "unexpected end of frame reading CRC",
+  "protected header FEC uncorrectable",
+  "PARITY_START marker not found",
+  "PARITY_END marker not found",
+]);
+const TRUNCATION_RETRY_TIMEOUT_MS = 20000;
+
 // ============================= fatal error display =============================
 
 // Any uncaught error here previously meant the page just silently did
@@ -231,6 +257,7 @@ let workletNode = null;
 let captureChunks = [];
 let captureSampleRate = SR;
 let scanPos = { phone: 0, fast_air: 0 };
+let scanStuckSince = { phone: null, fast_air: null }; // Date.now() a truncation-looking retry started, per mode
 let liveReassembler = new Reassembler();
 let pollTimer = null;
 
@@ -675,6 +702,7 @@ function handleDecodedFrame(frame, mode) {
 function resetCaptureBuffer() {
   captureChunks = [];
   scanPos = { phone: 0, fast_air: 0 };
+  scanStuckSince = { phone: null, fast_air: null };
 }
 
 async function handleNackFound(info) {
@@ -694,6 +722,22 @@ async function pollCapture(buffer) {
         break;
       }
       if (!frame) break;
+
+      if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
+        if (scanStuckSince[mode] === null) scanStuckSince[mode] = Date.now();
+        if (Date.now() - scanStuckSince[mode] < TRUNCATION_RETRY_TIMEOUT_MS) {
+          // Leave pos where it was -- don't report this as a failure, and
+          // retry this exact position next poll once more of the
+          // transmission has arrived, rather than skipping past it.
+          break;
+        }
+        // Waited long enough that this is more likely genuine corruption
+        // than a message still arriving -- give up waiting and report it.
+        scanStuckSince[mode] = null;
+      } else {
+        scanStuckSince[mode] = null;
+      }
+
       handleDecodedFrame(frame, mode);
       pos = frame.next_start;
     }
@@ -807,6 +851,7 @@ function stopCapture() {
 
 async function startListening() {
   scanPos = { phone: 0, fast_air: 0 };
+  scanStuckSince = { phone: null, fast_air: null };
   liveReassembler = new Reassembler();
   try {
     await startCapture(pollCapture);

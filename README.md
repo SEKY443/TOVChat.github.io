@@ -40,6 +40,24 @@ typewriter-key-styled controls.
     times out, and reassembles in JS with the same algorithm as
     `MessageReassembler::add`. Tries both `phone` and `fast_air` timing
     each poll.
+
+    **Found and fixed a real bug live-testing this against a real phone**:
+    live polling scans a buffer that's still *growing* while a
+    transmission is in flight, unlike `decode_from_pcm` scanning a fully-
+    captured file in one shot. Catching a message mid-arrival produced a
+    failure (`"payload extends past end of received data"`, etc. — exact
+    strings confirmed by deliberately truncating a real encode and
+    checking) that looked identical to genuine corruption, and the old
+    code advanced past that position regardless — permanently skipping
+    the message before the rest of it ever arrived, even though the same
+    transmission recorded to a file and decoded via DECODE FROM FILE
+    worked perfectly. Now those specific "ran out of real captured audio,
+    not corrupted" reasons hold the scan position and retry instead of
+    advancing, bounded by a 20s timeout so genuinely corrupted data still
+    eventually gets reported rather than stalling forever. Verified with
+    a full growing-buffer poll simulation against the compiled `.wasm`
+    binary: 6 polls correctly wait, the 7th (once the transmission has
+    fully arrived) decodes successfully.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is
