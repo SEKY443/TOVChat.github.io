@@ -51,15 +51,25 @@ typewriter-key-styled controls.
     triggers an automatic resend — no manual action needed on the
     sender's side, as long as it's listening.
 
-Verified as far as it can be without a live browser this session: every
-wasm-bindgen primitive round-trip tested against the actual compiled
-`.wasm` binary (see `wasm/src/lib.rs`'s doc comments), all JS syntax-
-checked, all asset paths confirmed relative (needed for the
-`/TOVChat.github.io/` subpath GitHub Pages serves this repo at — see
-below) and resolving over a local static server. **Not yet confirmed
-against a real microphone/speaker round trip** — needs a real browser
-session to validate, unlike everything upstream of it which was checked
-via Node against the compiled wasm directly.
+Verified live against the deployed site in a real browser (Chrome):
+username gate, send (real speaker playback, history rendering, bell),
+local resend, mode toggle, and file-based decode (uploaded a real
+generated WAV, decoded end-to-end with the correct username/id/text and
+a working request-resend affordance). Also caught and fixed a real bug
+this way that no amount of Node-level testing could have: `.gate` and
+`.screen` both set `display: flex` unconditionally, which silently beat
+the `hidden` attribute's implicit `display: none` (an attribute selector
+has far lower CSS specificity than any class rule) — the app was
+rendering correctly underneath the whole time, the gate just never
+visually got out of the way after BEGIN. Below that layer, every
+wasm-bindgen primitive is round-trip tested against the actual compiled
+`.wasm` binary (see `wasm/src/lib.rs`'s doc comments).
+
+**Not yet confirmed: a real microphone/speaker acoustic round trip.**
+Getting a mic-permission grant through requires a real user action on a
+real OS permission dialog (outside what any automation can click through
+on its own) — live capture wiring (`AudioWorkletNode`, the polling loop)
+is careful but unexercised beyond that.
 
 v1 deliberately does not include: addressing/contacts UI, encryption key
 exchange UX, `calibrate` mode. Broadcast + unencrypted only for now — the
@@ -67,19 +77,17 @@ username envelope is the "who's this from" mechanism in the meantime.
 
 ## What's next
 
-1. **Validate live mic/speaker round trip** in a real browser — the one
-   piece that couldn't be checked without one.
-2. GitHub Pages: enable it once in this repo's Settings → Pages → "Build
-   and deployment source: GitHub Actions" (one-time manual step, can't be
-   done via git). The deploy workflow
-   (`.github/workflows/deploy.yml`) builds the wasm module fresh and
-   publishes `www/` via `actions/upload-pages-artifact` +
-   `actions/deploy-pages` on every push to `main`. Served at
-   `https://seky443.github.io/TOVChat.github.io/` (a subpath, not the
-   domain root, since the GitHub account is `SEKY443` not `TOVChat`) —
-   all asset paths are relative, already accounting for that.
-3. Addressing/contacts UI, encryption key exchange UX, `calibrate` mode —
+1. **Validate a real microphone/speaker acoustic round trip** — grant mic
+   access when prompted and try sending between two tabs/devices.
+2. Addressing/contacts UI, encryption key exchange UX, `calibrate` mode —
    each needs its own UX design before it's worth building.
+
+GitHub Pages is live at `https://seky443.github.io/TOVChat.github.io/`
+(Settings → Pages → "Build and deployment source: GitHub Actions" is
+enabled) — a subpath, not the domain root, since the GitHub account is
+`SEKY443` not `TOVChat`; all asset paths are relative, already accounting
+for that. `.github/workflows/deploy.yml` builds the wasm module fresh and
+redeploys on every push to `main`.
 
 ## Building locally
 
