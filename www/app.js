@@ -21,14 +21,44 @@ const LISTEN_MODES = ["phone", "fast_air"];
 const POLL_INTERVAL_MS = 1200;
 const MAX_BUFFER_SECONDS = 40; // hard safety cap on the live capture ring buffer
 
+// ============================= fatal error display =============================
+
+// Any uncaught error here previously meant the page just silently did
+// nothing -- a click handler that throws partway through leaves no visible
+// trace without opening devtools. Surface it on the page instead.
+function showFatalError(context, err) {
+  console.error(context, err);
+  let banner = document.getElementById("fatal-error-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "fatal-error-banner";
+    banner.className = "fatal-error";
+    document.body.prepend(banner);
+  }
+  banner.textContent = `▢ ${context}: ${err && err.message ? err.message : err} ▢`;
+  banner.hidden = false;
+}
+
+window.addEventListener("error", (e) => showFatalError("SCRIPT ERROR", e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => showFatalError("SCRIPT ERROR", e.reason));
+
 // ============================= storage =============================
 
 function loadUsername() {
-  return localStorage.getItem(STORAGE_USERNAME) || "";
+  try {
+    return localStorage.getItem(STORAGE_USERNAME) || "";
+  } catch (e) {
+    showFatalError("CANNOT READ LOCAL STORAGE", e);
+    return "";
+  }
 }
 
 function saveUsername(name) {
-  localStorage.setItem(STORAGE_USERNAME, name);
+  try {
+    localStorage.setItem(STORAGE_USERNAME, name);
+  } catch (e) {
+    showFatalError("CANNOT SAVE USERNAME (PRIVATE BROWSING / STORAGE BLOCKED?)", e);
+  }
 }
 
 function loadHistory() {
@@ -41,8 +71,12 @@ function loadHistory() {
 }
 
 function saveHistory(history) {
-  const trimmed = history.slice(-MAX_HISTORY_ENTRIES);
-  localStorage.setItem(STORAGE_HISTORY, JSON.stringify(trimmed));
+  try {
+    const trimmed = history.slice(-MAX_HISTORY_ENTRIES);
+    localStorage.setItem(STORAGE_HISTORY, JSON.stringify(trimmed));
+  } catch (e) {
+    showFatalError("CANNOT SAVE HISTORY (PRIVATE BROWSING / STORAGE BLOCKED?)", e);
+  }
 }
 
 // ============================= envelope =============================
@@ -257,17 +291,21 @@ function validateUsername(name) {
 }
 
 function submitGate() {
-  const name = gateInput.value;
-  const err = validateUsername(name);
-  if (err) {
-    gateError.textContent = err;
-    gateError.hidden = false;
-    return;
+  try {
+    const name = gateInput.value;
+    const err = validateUsername(name);
+    if (err) {
+      gateError.textContent = err;
+      gateError.hidden = false;
+      return;
+    }
+    username = name.trim();
+    saveUsername(username);
+    gateError.hidden = true;
+    showApp();
+  } catch (e) {
+    showFatalError("COULD NOT START", e);
   }
-  username = name.trim();
-  saveUsername(username);
-  gateError.hidden = true;
-  showApp();
 }
 
 gateSubmit.addEventListener("click", submitGate);
@@ -629,11 +667,15 @@ fileInput.addEventListener("change", async (ev) => {
 // ============================= init =============================
 
 async function main() {
-  await init();
-  if (!username) {
-    showGate();
-  } else {
-    showApp();
+  try {
+    await init();
+    if (!username) {
+      showGate();
+    } else {
+      showApp();
+    }
+  } catch (e) {
+    showFatalError("FAILED TO LOAD (WASM MODULE)", e);
   }
 }
 
