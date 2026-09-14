@@ -272,6 +272,33 @@ typewriter-key-styled controls.
     regardless of how many places call it or whether the caller awaits
     the result. Verified by replaying the same conversation after the
     fix — rapid back-to-back replies now both deliver cleanly.
+
+    That queue only serializes *this device's own* sends against each
+    other, though — it can't stop a *different* device's speaker from
+    playing at the same real-world moment, a separate `AudioContext`
+    entirely. **Collision avoidance, CSMA/CA-style**, closes that gap:
+    before any clip starts playing, if this device is listening, it
+    checks the live mic level (already tracked for the level meter) and,
+    if the channel currently reads busy, waits a randomized interval and
+    re-checks — the same carrier-sense-then-random-backoff shape real
+    network collision avoidance uses — instead of transmitting blind into
+    whatever the channel is doing. Gives up and sends anyway after a
+    bounded wait rather than potentially waiting forever. A device that
+    isn't listening has no mic level to check and transmits blind, same
+    as always.
+
+    **Also found live**: replying quickly still sometimes rang the bell
+    twice for what was clearly one message. Cause: `RETRY_ACK_GRACE_MS`
+    (6s) was tight enough that a completely successful delivery could
+    still occasionally outrun it — poll latency both ways, decode time,
+    and now carrier-sense waiting all eat into that budget — triggering
+    an unneeded resend that the receiver then decoded a second time,
+    correctly ringing the bell again for what it had no way to know was a
+    duplicate. Fixed on both ends: the grace period is more generous
+    (10s), and `handleDecodedFrame` now tracks which message ids it's
+    already fully received, so a redundant resend still gets re-acked
+    (the sender genuinely needs to hear that) but doesn't re-announce
+    itself to the user.
 - **Calibrate** (the machine bar's "▸ CALIBRATE" link) — mirrors the CLI's
   `calibrate-send`/`calibrate-listen`: find which `(mode, parity_bytes)`
   setting(s) actually survive this specific real channel, instead of
@@ -315,7 +342,16 @@ typewriter-key-styled controls.
   real-time decode readout box already used, instead of the text just
   appearing fully formed the instant a frame completes. History loaded
   from storage on page load is seeded as already-fully-revealed so a
-  reload never replays the animation for old messages.
+  reload never replays the animation for old messages. Refined per
+  feedback: each character now flickers through a couple of scrambled
+  8-bit binary guesses, settles on its real 8-bit code, then resolves
+  into the actual letter — raw data to letters to words, leaning into
+  the modem/teletype theme instead of just typing in plainly. Shared
+  (`flickerInChar`) between this and the live-decode preview box so both
+  reveals look and feel the same. Not a literal reconstruction of this
+  app's actual wire bytes (those depend on charset/dictionary compression
+  this layer doesn't have visibility into) — a plausible-looking flicker
+  in service of the effect, not a debugging tool.
 
 Verified live against the deployed site in a real browser (Chrome):
 username gate, send (real speaker playback, history rendering), local

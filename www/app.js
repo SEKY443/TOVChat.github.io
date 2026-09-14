@@ -21,7 +21,14 @@ const DEFAULT_MAX_RETRIES = 3;
 // an ack frame (short, but not instant), and for that ack's own preamble +
 // header to arrive back -- not scaled to message length since that's
 // already accounted for by scheduling this timer only after playback ends.
-const RETRY_ACK_GRACE_MS = 6000;
+// Found live too tight at 6s: the full round trip (poll latency on their
+// end + decode + carrier-sense wait if the channel was busy + the ack's
+// own travel time + poll latency on this end) can genuinely run past 6s
+// even when delivery is completely fine, triggering an unneeded resend --
+// which the *receiver* then decodes a second time, ringing the bell twice
+// for what the user rightly hears as one message (see handleDecodedFrame's
+// alreadyReceived check, the other half of that fix).
+const RETRY_ACK_GRACE_MS = 10000;
 
 const MSG_START = "\x02";
 const USERNAME_SEP = "\x1F";
@@ -60,11 +67,33 @@ const MEANINGFUL_FAILURES = new Map([
   ["frame is encrypted but no session key was provided", "ENCRYPTED — NO KEY TO DECRYPT"],
 ]);
 const TYPEWRITER_CHAR_MS = 18;
+// Per-character "decode" flicker -- raw guessed bits settling into the
+// real 8-bit code, then resolving into the actual letter -- shown before
+// a character locks in, in both the live-decode preview box and a chat
+// bubble's reveal. Skipped for whitespace (nothing interesting to flicker
+// through, and skipping keeps word-boundary pacing snappy).
+const DECODE_BINARY_FLICKER_FRAMES = 2; // scrambled guesses before the real bits show
+const DECODE_BINARY_HOLD_MS = 35; // how long each scrambled/real-bits frame holds
+const DECODE_BITS_HOLD_MS = 55; // how long the real 8-bit code holds before resolving to the letter
 const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
 const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
+
+// Collision avoidance, CSMA/CA-style (found live: two devices replying to
+// each other in quick succession is exactly the scenario where both can
+// end up transmitting at once -- playPcm's queue (see below) only
+// serializes THIS device's own sends against each other, not against a
+// different device's speaker on the same acoustic channel). Before each
+// clip starts, if this device is listening, wait for the mic to read
+// quiet; if it's currently busy, back off a random interval and re-check,
+// the same shape as real CSMA/CA collision avoidance. A device that isn't
+// listening has no way to sense the channel and transmits blind, same as
+// before this existed.
+const CARRIER_SENSE_BUSY_THRESHOLD = 0.06; // normalized peak amplitude considered "channel busy" (~-24dBFS)
+const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks
+const CARRIER_SENSE_MAX_WAIT_MS = 4000; // give up waiting and transmit anyway after this long
 
 // Exact reason strings protocol.rs reports when a frame ran out of REAL
 // captured audio partway through reading it -- not corruption, just "the
@@ -303,6 +332,12 @@ let maxRetries = loadMaxRetries();
 const pendingDeliveries = new Map();
 
 let suppressCaptureUntil = 0; // performance.now() timestamp -- see playPcm
+let currentMicPeak = 0; // last-measured mic peak, refreshed every MIC_METER_UPDATE_MS -- see waitForClearChannel
+// rx message ids already fully received at least once this session -- lets
+// handleDecodedFrame tell "a redundant resend of something we already got"
+// apart from "genuinely new," so a resend triggered by a lost/late ack
+// doesn't ring the bell again for what the user hears as one message.
+const receivedMessageIds = new Set();
 
 let liveDecodeId = null; // message id currently shown in the live decode box
 let liveDecodeUsername = "";
@@ -409,17 +444,49 @@ function renderEntry(entry) {
   return slip;
 }
 
-/// Types `fullText` into `el` one character at a time, starting from
-/// `startAt` (already-shown) characters, recording progress in
-/// `revealedChars` as it goes -- so a message the live poll is still
-/// filling in (multi-frame) or that renderHistory() happens to re-render
-/// mid-reveal (a full-list rebuild, no incremental DOM diffing here) picks
-/// up from wherever it actually got to, in the real chat bubble, rather
-/// than the text just appearing all at once the moment a frame completes.
+function charBits(ch) {
+  // Just the low byte of the code point -- a plausible-looking "raw data"
+  // flicker, not a literal reconstruction of this app's actual wire bytes
+  // (which depend on charset/dictionary compression and UTF-8 boundary
+  // encoding this layer doesn't have visibility into). Good enough for the
+  // effect it's going for: bits settling into a letter.
+  return (ch.codePointAt(0) & 0xff).toString(2).padStart(8, "0");
+}
+
+/// Reveals one more character onto `prefix` via `setText` (a callback
+/// given the full text-so-far) -- for a non-whitespace character, a few
+/// scrambled 8-bit guesses, then the real 8-bit code, then the resolved
+/// letter; whitespace just appears, no flicker. Shared by
+/// `animateEntryReveal` (a chat bubble) and `typewriterReveal` (the
+/// live-decode preview box) so the two reveals look and feel the same.
+async function flickerInChar(setText, prefix, ch) {
+  if (ch.trim() === "") {
+    setText(prefix + ch);
+    await sleep(TYPEWRITER_CHAR_MS);
+    return;
+  }
+  for (let f = 0; f < DECODE_BINARY_FLICKER_FRAMES; f++) {
+    const scrambled = Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
+    setText(prefix + scrambled);
+    await sleep(DECODE_BINARY_HOLD_MS);
+  }
+  setText(prefix + charBits(ch));
+  await sleep(DECODE_BITS_HOLD_MS);
+  setText(prefix + ch);
+}
+
+/// Reveals `fullText` into `el` one character at a time (via
+/// `flickerInChar`), starting from `startAt` (already-shown) characters,
+/// recording progress in `revealedChars` as it goes -- so a message the
+/// live poll is still filling in (multi-frame) or that renderHistory()
+/// happens to re-render mid-reveal (a full-list rebuild, no incremental
+/// DOM diffing here) picks up from wherever it actually got to, in the
+/// real chat bubble, rather than the text just appearing all at once the
+/// moment a frame completes.
 async function animateEntryReveal(el, fullText, startAt, key) {
   let i = startAt;
   while (i < fullText.length) {
-    await sleep(TYPEWRITER_CHAR_MS);
+    await flickerInChar((t) => { el.textContent = t; }, fullText.slice(0, i), fullText[i]);
     // A newer render of the same bubble (or a reset/overwrite) may have
     // moved reveal progress on without this loop's help -- never regress
     // past what's already been recorded or shown elsewhere.
@@ -572,12 +639,16 @@ const CAPTURE_SUPPRESS_TAIL_S = 0.4;
 // *and* the reply (never decoded on the other end either). Chaining every
 // call onto this promise, instead of starting playback immediately, makes
 // "one clip plays at a time" true regardless of how many places call
-// playPcm or whether the caller awaits the result.
+// playPcm or whether the caller awaits the result. This queue only
+// serializes THIS device's own sends against each other, though -- a
+// different device transmitting at the same moment is a separate
+// AudioContext entirely, which is what waitForClearChannel (called first,
+// inside the queue) exists to avoid colliding with.
 let playbackQueue = Promise.resolve();
 
 function playPcm(float32Samples, sampleRate) {
   const task = playbackQueue.then(() =>
-    ensureAudioContext().then((ctx) => {
+    waitForClearChannel().then(() => ensureAudioContext()).then((ctx) => {
       return new Promise((resolve) => {
         const leadIn = Math.round(LEAD_IN_SILENCE_S * sampleRate);
         const buffer = ctx.createBuffer(1, leadIn + float32Samples.length, sampleRate);
@@ -876,10 +947,9 @@ function hideLiveDecode() {
 
 async function typewriterReveal(fullText, startAt) {
   const token = ++liveDecodeRevealToken;
-  for (let i = startAt; i <= fullText.length; i++) {
+  for (let i = startAt; i < fullText.length; i++) {
     if (token !== liveDecodeRevealToken) return; // superseded by a newer reveal
-    liveDecodeTextEl.textContent = fullText.slice(0, i);
-    await sleep(TYPEWRITER_CHAR_MS);
+    await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i]);
   }
 }
 
@@ -936,8 +1006,18 @@ function handleDecodedFrame(frame, mode) {
         framesExpected: result.framesExpected,
       });
     }
-    onLiveMessageComplete();
-    ringBell();
+    // A resend the sender only sent because it never heard our first ack
+    // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
+    // identical to a genuinely new message here -- same id, same content,
+    // decoded clean. Re-send the ack regardless (that's the whole point:
+    // the sender is still waiting), but don't re-announce something the
+    // user already saw arrive once.
+    const alreadyReceived = receivedMessageIds.has(tag.id);
+    receivedMessageIds.add(tag.id);
+    if (!alreadyReceived) {
+      onLiveMessageComplete();
+      ringBell();
+    }
     sendAckFor(tag.id, mode); // fire-and-forget -- see sendAckFor
     // The buffer is never trimmed as it's consumed (only ever grows, up
     // to the hard MAX_BUFFER_SECONDS cap), so without this a long
@@ -1066,12 +1146,29 @@ async function pollCapture(buffer) {
 function resetMicLevel() {
   micLevelFillEl.style.width = "0%";
   micLevelDbEl.textContent = "−∞ dB";
+  currentMicPeak = 0;
 }
 
 function updateMicLevelDisplay(peak) {
   const pct = Math.min(100, (peak / MIC_METER_FULL_SCALE) * 100);
   micLevelFillEl.style.width = `${pct}%`;
   micLevelDbEl.textContent = peak > 0 ? `${(20 * Math.log10(peak)).toFixed(0)} dB` : "−∞ dB";
+  currentMicPeak = peak;
+}
+
+/// Waits for the channel to sound quiet before a transmission starts --
+/// see the CARRIER_SENSE_* constants for why. A device that isn't
+/// listening has no mic level to check and returns immediately (transmits
+/// blind, same as before this existed).
+async function waitForClearChannel() {
+  if (!listening || currentMicPeak <= CARRIER_SENSE_BUSY_THRESHOLD) return; // common case: already clear
+  const previousStatus = carriageStatus.textContent;
+  const deadline = performance.now() + CARRIER_SENSE_MAX_WAIT_MS;
+  while (currentMicPeak > CARRIER_SENSE_BUSY_THRESHOLD && performance.now() < deadline) {
+    setCarriageStatus("● CHANNEL BUSY, WAITING…");
+    await sleep(CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS);
+  }
+  setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
 }
 
 async function startCapture(onPoll) {
