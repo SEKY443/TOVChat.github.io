@@ -1151,6 +1151,47 @@ window.__tovDiag = {
     }
     return { sampleRate: captureSampleRate, samples: merged.length, base64: btoa(bin) };
   },
+  downloadCapture() {
+    const total = captureChunks.reduce((n, c) => n + c.length, 0);
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of captureChunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    const i16 = new Int16Array(merged.length);
+    for (let i = 0; i < merged.length; i++) {
+      const s = Math.max(-1, Math.min(1, merged[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const dataSize = i16.length * 2;
+    const buf = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buf);
+    const ws = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+    ws(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    ws(8, "WAVE");
+    ws(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, captureSampleRate, true);
+    view.setUint32(28, captureSampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    ws(36, "data");
+    view.setUint32(40, dataSize, true);
+    new Int16Array(buf, 44).set(i16);
+    const blob = new Blob([buf], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "tov-capture-diag.wav";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return { samples: merged.length, sampleRate: captureSampleRate, bytes: buf.byteLength };
+  },
 };
 
 // ============================= init =============================
