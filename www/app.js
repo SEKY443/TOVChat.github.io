@@ -420,7 +420,6 @@ async function sendMessage() {
   setCarriageStatus("● TRANSMITTING…");
   try {
     await playPcm(pcm, SR);
-    ringBell();
   } finally {
     sendKey.disabled = false;
     setCarriageStatus(listening ? "● LISTENING…" : "▢ TYPE YOUR MESSAGE ▢");
@@ -435,7 +434,6 @@ async function resendOwnMessage(id) {
   try {
     const pcm = encode_frames_to_pcm(entry.chunks, entry.mode, undefined, undefined, undefined);
     await playPcm(pcm, SR);
-    ringBell();
   } catch (e) {
     setCarriageStatus(`▢ RESEND FAILED: ${e} ▢`);
   } finally {

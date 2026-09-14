@@ -25,9 +25,11 @@ typewriter-key-styled controls.
   frames (`wasm/src/lib.rs`'s `encode_frames_to_pcm` — unlike
   `encode_to_pcm`, which hands one whole string to
   `message::build_message`'s own auto-splitter and would only tag frame
-  0), and played through the Web Audio API. Bell sound
-  (`bell_sound.wav`, CC0/public domain) rings once playback completes.
-- **Receive**, two ways:
+  0), and played through the Web Audio API.
+- **Receive**, two ways, both ringing the bell
+  (`bell_sound.wav`, CC0/public domain) only once a message actually
+  decodes successfully — never on send, which just confirms audio played,
+  not that anyone heard it:
   - **Live microphone** via an `AudioWorkletNode` (`capture-worklet.js`)
     forwarding raw samples to a polling loop — mirrors CLI-TextOverVoice's
     `live.rs` design (non-blocking audio callback pushes into a buffer, a
@@ -69,10 +71,11 @@ typewriter-key-styled controls.
   compiled `.wasm` binary directly.
 
 Verified live against the deployed site in a real browser (Chrome):
-username gate, send (real speaker playback, history rendering, bell),
-local resend, mode toggle, and file-based decode (uploaded a real
-generated WAV, decoded end-to-end with the correct username/id/text and
-a working request-resend affordance). Also caught and fixed a real bug
+username gate, send (real speaker playback, history rendering), local
+resend, mode toggle, and file-based decode (uploaded a real generated
+WAV, decoded end-to-end with the correct username/id/text, bell ringing
+on that successful decode, and a working request-resend affordance).
+Also caught and fixed a real bug
 this way that no amount of Node-level testing could have: `.gate` and
 `.screen` both set `display: flex` unconditionally, which silently beat
 the `hidden` attribute's implicit `display: none` (an attribute selector
