@@ -133,7 +133,45 @@ const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak 
 // the same shape as real CSMA/CA collision avoidance. A device that isn't
 // listening has no way to sense the channel and transmits blind, same as
 // before this existed.
-const CARRIER_SENSE_BUSY_THRESHOLD = 0.06; // normalized peak amplitude considered "channel busy" (~-24dBFS)
+//
+// "Busy" itself is decided by an adaptive squelch, not a fixed threshold
+// -- ported directly from CLI-TextOverVoice's live.rs Squelch (checked the
+// actual reference implementation rather than guessing at one): a
+// fast-moving recent-energy estimate (RMS per captured chunk, matching the
+// CLI's own `rms()`) against a slow-moving ambient-noise floor, "busy"
+// once the fast estimate is well above that floor. A single fixed
+// number can't be right everywhere -- a loud room's ordinary ambient
+// noise can sit above a quiet room's real signal -- so this tracks each
+// device's own actual environment instead. The floor only updates while
+// the channel currently reads quiet (fast estimate below the busy
+// threshold); otherwise a loud, sustained tone burst would drag its own
+// floor up and eventually stop looking "busy" at all, same rationale the
+// CLI's own doc comment gives.
+const SQUELCH_FAST_ALPHA = 0.3;
+const SQUELCH_FLOOR_ALPHA = 0.01;
+const SQUELCH_BUSY_MULTIPLIER = 4.0;
+const SQUELCH_MIN_FLOOR = 0.0005; // absolute floor so a near-silent source doesn't call every nonzero signal "busy"
+let squelchFast = 0;
+let squelchFloor = 0;
+
+function squelchUpdate(rms) {
+  if (!Number.isFinite(rms)) return; // guard against a pathological driver producing NaN/Infinity, same as the CLI's Squelch::update
+  squelchFast = SQUELCH_FAST_ALPHA * rms + (1 - SQUELCH_FAST_ALPHA) * squelchFast;
+  const effectiveFloor = Math.max(squelchFloor, SQUELCH_MIN_FLOOR);
+  if (squelchFast < effectiveFloor * SQUELCH_BUSY_MULTIPLIER) {
+    squelchFloor = SQUELCH_FLOOR_ALPHA * squelchFast + (1 - SQUELCH_FLOOR_ALPHA) * squelchFloor;
+  }
+}
+
+function squelchIsBusy() {
+  return squelchFast > Math.max(squelchFloor, SQUELCH_MIN_FLOOR) * SQUELCH_BUSY_MULTIPLIER;
+}
+
+function squelchReset() {
+  squelchFast = 0;
+  squelchFloor = 0;
+}
+
 const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks
 const CARRIER_SENSE_MAX_WAIT_MS = 4000; // give up waiting and transmit anyway after this long
 // Found live with more than two listening devices: several receivers can
@@ -1365,6 +1403,7 @@ function resetMicLevel() {
   micLevelFillEl.style.width = "0%";
   micLevelDbEl.textContent = "−∞ dB";
   currentMicPeak = 0;
+  squelchReset();
 }
 
 function updateMicLevelDisplay(peak) {
@@ -1374,8 +1413,9 @@ function updateMicLevelDisplay(peak) {
   currentMicPeak = peak;
 }
 
-/// Waits for the channel to sound quiet before a transmission starts, then
-/// makes it wait a short random jitter on top and re-checks -- see the
+/// Waits for the channel to sound quiet (per the adaptive squelch, see
+/// SQUELCH_*/squelchIsBusy above) before a transmission starts, then makes
+/// it wait a short random jitter on top and re-checks -- see the
 /// CARRIER_SENSE_* constants for why the jitter applies even on an
 /// already-clear channel, not just a busy one. A device that isn't
 /// listening has no mic level to check and returns immediately (transmits
@@ -1387,9 +1427,9 @@ async function waitForClearChannel() {
   let waited = 0;
   let announcedBusy = false;
   while (performance.now() < deadline) {
-    if (currentMicPeak > CARRIER_SENSE_BUSY_THRESHOLD) {
+    if (squelchIsBusy()) {
       if (!announcedBusy) {
-        dbg("carrier-busy", "peak=" + currentMicPeak.toFixed(3), "waiting before transmit");
+        dbg("carrier-busy", "fast=" + squelchFast.toFixed(4), "floor=" + squelchFloor.toFixed(4), "waiting before transmit");
         announcedBusy = true;
       }
       setCarriageStatus("● CHANNEL BUSY, WAITING…");
@@ -1406,7 +1446,7 @@ async function waitForClearChannel() {
     const jitter = CARRIER_SENSE_JITTER_MIN_MS + Math.random() * (CARRIER_SENSE_JITTER_MAX_MS - CARRIER_SENSE_JITTER_MIN_MS);
     waited += jitter;
     await sleep(jitter);
-    if (currentMicPeak <= CARRIER_SENSE_BUSY_THRESHOLD) {
+    if (!squelchIsBusy()) {
       dbg("carrier-clear", "channel clear after", Math.round(waited) + "ms");
       setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
       return;
@@ -1445,10 +1485,17 @@ async function startCapture(onPoll) {
   workletNode.port.onmessage = (e) => {
     if (performance.now() < suppressCaptureUntil) return; // ignore our own transmission -- see playPcm
     appendCaptureChunk(e.data);
+    let sumSquares = 0;
     for (const v of e.data) {
       const a = Math.abs(v);
       if (a > meterPeak) meterPeak = a;
+      sumSquares += v * v;
     }
+    // Feed the adaptive squelch with this chunk's RMS, same signal (and
+    // same per-callback cadence) the CLI's own Squelch::update is fed --
+    // not the peak the level meter uses, which is spikier and less
+    // representative of ongoing channel energy.
+    if (e.data.length > 0) squelchUpdate(Math.sqrt(sumSquares / e.data.length));
     const now = performance.now();
     if (now - lastMeterUpdate >= MIC_METER_UPDATE_MS) {
       lastMeterUpdate = now;

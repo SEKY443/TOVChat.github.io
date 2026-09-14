@@ -377,6 +377,19 @@ typewriter-key-styled controls.
     during that jitter — so multiple devices all finding the channel idle
     at the same moment get staggered instead of firing together.
 
+    **Busy detection itself switched from a fixed threshold to an adaptive
+    squelch**, ported directly from CLI-TextOverVoice's `live.rs`
+    `Squelch` (checked the actual reference implementation rather than
+    picking a number by feel): a fast-moving RMS estimate against a
+    slow-moving ambient-noise floor, "busy" once the fast estimate sits
+    well above that floor, the floor itself only updating while the
+    channel currently reads quiet (so a loud, sustained transmission can't
+    drag its own floor up and eventually stop looking busy). A single
+    fixed amplitude can't be right in every room — a loud environment's
+    ordinary background noise can sit above a quiet room's real signal —
+    so this tracks each device's own actual surroundings instead of
+    guessing at one number for all of them.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
