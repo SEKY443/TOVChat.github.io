@@ -53,11 +53,29 @@ typewriter-key-styled controls.
     transmission recorded to a file and decoded via DECODE FROM FILE
     worked perfectly. Now those specific "ran out of real captured audio,
     not corrupted" reasons hold the scan position and retry instead of
-    advancing, bounded by a 20s timeout so genuinely corrupted data still
+    advancing, bounded by a timeout so genuinely corrupted data still
     eventually gets reported rather than stalling forever. Verified with
     a full growing-buffer poll simulation against the compiled `.wasm`
     binary: 6 polls correctly wait, the 7th (once the transmission has
     fully arrived) decodes successfully.
+
+    **Second round, also found live**: the fix above worked once, then
+    was unreliable on repeat sends. The retry set had included two
+    *ambiguous* reasons (`"protected header FEC uncorrectable"`, the
+    Legacy marker-not-found pair) that can also mean genuine corruption
+    on complete data — and ambient noise occasionally triggers a false
+    preamble match that fails with exactly one of these. Retrying those
+    froze the scan position on the noise hit for the whole retry window,
+    so a real transmission arriving during that window was missed
+    entirely — silently, with no failure shown, since the code was still
+    "waiting." Narrowed the retry set to only the reasons reachable *after*
+    the header has already been successfully RS-corrected (meaning a
+    real, synced transmission is definitely in progress, not noise) and
+    extended the timeout to 120s now that it's provably safe to wait that
+    long. The ambiguous ones revert to reporting immediately, accepting a
+    narrow (~0.5–0.7s) window where a header genuinely split across a
+    poll boundary might need a manual resend, in exchange for never
+    blocking real signal detection on a noise blip again.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is

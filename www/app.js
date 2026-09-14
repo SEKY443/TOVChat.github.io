@@ -62,25 +62,30 @@ const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak 
 // directly: scanning a deliberately-truncated encode of a real message
 // reproduces these exact strings, never seen on complete data). Live
 // polling scans a buffer that's still GROWING while a transmission is in
-// flight, unlike a fully-captured file, so this is routine, not rare --
-// and the old code treated it exactly like real corruption, permanently
-// skipping past the position via next_start before the rest of the
-// message ever arrived. "protected header FEC uncorrectable" and the
-// Legacy marker-not-found reasons are ambiguous (could also be genuine
-// correction failure on already-complete data), but truncation is the
-// far more likely explanation while a live poll is still filling in --
-// TRUNCATION_RETRY_TIMEOUT_MS is the safety net for the case where it
-// really was just corrupted.
+// flight, unlike a fully-captured file, so this is routine, not rare.
+//
+// Deliberately NOT included: "protected header FEC uncorrectable" and the
+// Legacy PARITY_START/END "marker not found" reasons. Those are ambiguous
+// -- they can also mean genuine correction failure on already-complete
+// data -- and, worse, live-testing showed ambient noise occasionally
+// triggers a false preamble match that fails with exactly one of these.
+// Treating those as "retry, don't advance" froze the scan position on the
+// noise hit for the full retry window, causing a REAL transmission
+// arriving during that window to be missed entirely (confirmed: "works
+// once, then unreliable" was this). The reasons below can only be reached
+// AFTER the header has already been successfully RS-corrected -- meaning
+// a real, synced transmission is definitely in progress, not noise -- so
+// they're safe to always wait out.
 const TRUNCATION_REASONS = new Set([
-  "unexpected end of frame",
-  "payload extends past end of received data",
+  "unexpected end of frame", // Legacy header read hit EOF -- unambiguous, no FEC step to conflate with
+  "payload extends past end of received data", // ProtectedHeader, header already validated
   "unexpected end of frame reading parity",
   "unexpected end of frame reading CRC",
-  "protected header FEC uncorrectable",
-  "PARITY_START marker not found",
-  "PARITY_END marker not found",
 ]);
-const TRUNCATION_RETRY_TIMEOUT_MS = 20000;
+// Generous: since these reasons are now provably tied to a real, already-
+// synced transmission, the bound only needs to comfortably cover the
+// longest realistic message in the slowest mode, not guard against noise.
+const TRUNCATION_RETRY_TIMEOUT_MS = 120000;
 
 // ============================= fatal error display =============================
 
