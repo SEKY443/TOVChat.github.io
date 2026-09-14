@@ -246,6 +246,39 @@ button, input, textarea {
   margin-bottom: 6px;
 }
 
+.mic-level {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.mic-level-label {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: #b9b4a8;
+  flex-shrink: 0;
+}
+.mic-level-bar {
+  flex: 1;
+  height: 8px;
+  border: 1px solid #f7f5ee;
+  padding: 1px;
+}
+.mic-level-fill {
+  height: 100%;
+  width: 0%;
+  background: #f7f5ee;
+  transition: width 60ms linear;
+}
+.mic-level-db {
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: #b9b4a8;
+  flex-shrink: 0;
+  width: 5.5em;
+  text-align: right;
+}
+
 .live-decode-text {
   font-size: 15px;
   line-height: 1.4;

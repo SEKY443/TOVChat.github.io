@@ -52,6 +52,8 @@ const MEANINGFUL_FAILURES = new Map([
 const TYPEWRITER_CHAR_MS = 18;
 const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
+const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
+const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 
 // ============================= fatal error display =============================
 
@@ -212,6 +214,8 @@ const calibrateResultsEl = document.getElementById("calibrate-results");
 const liveDecodeEl = document.getElementById("live-decode");
 const liveDecodeStatusEl = document.getElementById("live-decode-status");
 const liveDecodeTextEl = document.getElementById("live-decode-text");
+const micLevelFillEl = document.getElementById("mic-level-fill");
+const micLevelDbEl = document.getElementById("mic-level-db");
 
 // ============================= state =============================
 
@@ -694,6 +698,24 @@ async function pollCapture(buffer) {
 /// it's captured. Throws (with the mic-access-denied message already set)
 /// if permission is refused; callers should not flip their own "active"
 /// UI state until this resolves.
+// A real, honest "is my mic hearing anything at all" readout -- added
+// after live-testing where the send/receive pipeline was correct but a
+// weak real-world acoustic path made it hard to tell whether the mic was
+// picking up nothing, or picking up something too quiet/unclean to
+// demodulate. Peak amplitude of every captured chunk, redrawn at most
+// every MIC_METER_UPDATE_MS (chunks arrive far more often than that would
+// be useful to redraw the DOM).
+function resetMicLevel() {
+  micLevelFillEl.style.width = "0%";
+  micLevelDbEl.textContent = "−∞ dB";
+}
+
+function updateMicLevelDisplay(peak) {
+  const pct = Math.min(100, (peak / MIC_METER_FULL_SCALE) * 100);
+  micLevelFillEl.style.width = `${pct}%`;
+  micLevelDbEl.textContent = peak > 0 ? `${(20 * Math.log10(peak)).toFixed(0)} dB` : "−∞ dB";
+}
+
 async function startCapture(onPoll) {
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
@@ -703,11 +725,24 @@ async function startCapture(onPoll) {
   await ctx.audioWorklet.addModule("./capture-worklet.js");
   captureSampleRate = ctx.sampleRate;
   captureChunks = [];
+  resetMicLevel();
 
+  let meterPeak = 0;
+  let lastMeterUpdate = 0;
   const source = ctx.createMediaStreamSource(mediaStream);
   workletNode = new AudioWorkletNode(ctx, "capture-processor");
   workletNode.port.onmessage = (e) => {
     captureChunks.push(e.data);
+    for (const v of e.data) {
+      const a = Math.abs(v);
+      if (a > meterPeak) meterPeak = a;
+    }
+    const now = performance.now();
+    if (now - lastMeterUpdate >= MIC_METER_UPDATE_MS) {
+      lastMeterUpdate = now;
+      updateMicLevelDisplay(meterPeak);
+      meterPeak = 0;
+    }
   };
   source.connect(workletNode);
 
@@ -730,6 +765,7 @@ function stopCapture() {
   workletNode = null;
   mediaStream = null;
   captureChunks = [];
+  resetMicLevel();
 }
 
 async function startListening() {

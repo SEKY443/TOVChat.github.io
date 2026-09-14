@@ -56,6 +56,14 @@ typewriter-key-styled controls.
     found and fixed a real race live-testing this: two separate timers
     let a completion's reset fire mid-flash and cut a later failure
     notice short.
+  - **Mic level meter**, alongside the readout: a live peak-amplitude bar
+    + dB readout, redrawn from every captured audio chunk. Added after
+    live acoustic testing on real hardware where the send/receive
+    pipeline was confirmed correct end-to-end but it was genuinely
+    ambiguous whether a failed receive meant "mic hearing nothing" or
+    "mic hearing something too quiet/unclean to demodulate" — this makes
+    that distinction visible instead of needing an ad-hoc script to
+    measure it.
 - **Resend**, both directions:
   - A sent message always gets a local one-click resend (replays from
     its stored chunks/settings, no audio round trip needed).
