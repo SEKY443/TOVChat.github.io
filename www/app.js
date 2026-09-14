@@ -54,6 +54,7 @@ const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
 const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
+const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
 
 // ============================= fatal error display =============================
 
@@ -511,6 +512,32 @@ function materializeCaptureBuffer() {
   return merged;
 }
 
+/// Scales the whole buffer up so its peak reaches NORMALIZE_TARGET_PEAK,
+/// if it isn't already at least that loud. This is deliberately the same
+/// kind of post-hoc, whole-buffer-aware gain a recording app effectively
+/// applies when it normalizes a finished file -- found live-testing that
+/// it's what actually closes the gap between "a recorded file of a real
+/// transmission decodes fine via DECODE FROM FILE" and "the identical
+/// live signal doesn't decode": the browser's own real-time
+/// autoGainControl is voice-tuned with a slow, causal ramp-up that a
+/// short tone burst can come and go faster than, where this can just look
+/// at the whole already-captured buffer and scale it correctly in one
+/// step, no ramp-up needed. Uniform amplitude scaling only, same
+/// reasoning as autoGainControl being safe to enable: it doesn't touch
+/// frequency content the way noise suppression would.
+function normalizePeak(buffer) {
+  let peak = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    const a = Math.abs(buffer[i]);
+    if (a > peak) peak = a;
+  }
+  if (peak === 0 || peak >= NORMALIZE_TARGET_PEAK) return buffer;
+  const gain = NORMALIZE_TARGET_PEAK / peak;
+  const normalized = new Float32Array(buffer.length);
+  for (let i = 0; i < buffer.length; i++) normalized[i] = buffer[i] * gain;
+  return normalized;
+}
+
 // ============================= live decode readout =============================
 //
 // Drives the box shown above the input while LISTEN is active: a
@@ -763,7 +790,7 @@ async function startCapture(onPoll) {
       captureChunks = [];
       return;
     }
-    onPoll(buffer);
+    onPoll(normalizePeak(buffer));
   }, POLL_INTERVAL_MS);
 }
 
