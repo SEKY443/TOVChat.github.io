@@ -270,6 +270,15 @@ const micLevelDbEl = document.getElementById("mic-level-db");
 
 let username = loadUsername();
 let history = loadHistory();
+// How many characters of each received message's text have already been
+// shown in its chat bubble -- lets renderEntry tell "this text just grew
+// live, animate the new part in" apart from "this is history loaded from
+// storage, show it instantly." Seeded below to each entry's full length so
+// a page load never replays the reveal for old messages.
+const revealedChars = new Map(); // "rx:<id>" -> character count
+for (const h of history) {
+  if (h.dir === "rx") revealedChars.set(`rx:${h.id}`, h.text.length);
+}
 let selectedMode = "phone";
 let audioCtx = null;
 
@@ -285,7 +294,10 @@ let pollTimer = null;
 
 let calibrating = false;
 let calibrateScanPos = new Map(); // "mode:parity" -> sample offset
+let calibrateStuckSince = new Map(); // "mode:parity" -> Date.now() a truncation-looking retry started
 let calibrateMatches = new Set(); // "mode:parity" already reported
+
+let suppressCaptureUntil = 0; // performance.now() timestamp -- see playPcm
 
 let liveDecodeId = null; // message id currently shown in the live decode box
 let liveDecodeUsername = "";
@@ -328,7 +340,18 @@ function renderEntry(entry) {
 
   const text = document.createElement("div");
   text.className = "slip-text";
-  text.textContent = entry.text;
+  if (entry.dir === "rx") {
+    const key = `rx:${entry.id}`;
+    const already = revealedChars.get(key) ?? 0;
+    if (already >= entry.text.length) {
+      text.textContent = entry.text;
+    } else {
+      text.textContent = entry.text.slice(0, already);
+      animateEntryReveal(text, entry.text, already, key);
+    }
+  } else {
+    text.textContent = entry.text;
+  }
 
   slip.append(head, text);
 
@@ -369,6 +392,27 @@ function renderEntry(entry) {
   }
 
   return slip;
+}
+
+/// Types `fullText` into `el` one character at a time, starting from
+/// `startAt` (already-shown) characters, recording progress in
+/// `revealedChars` as it goes -- so a message the live poll is still
+/// filling in (multi-frame) or that renderHistory() happens to re-render
+/// mid-reveal (a full-list rebuild, no incremental DOM diffing here) picks
+/// up from wherever it actually got to, in the real chat bubble, rather
+/// than the text just appearing all at once the moment a frame completes.
+async function animateEntryReveal(el, fullText, startAt, key) {
+  let i = startAt;
+  while (i < fullText.length) {
+    await sleep(TYPEWRITER_CHAR_MS);
+    // A newer render of the same bubble (or a reset/overwrite) may have
+    // moved reveal progress on without this loop's help -- never regress
+    // past what's already been recorded or shown elsewhere.
+    if ((revealedChars.get(key) ?? 0) > i) i = revealedChars.get(key);
+    i++;
+    revealedChars.set(key, i);
+    el.textContent = fullText.slice(0, i);
+  }
 }
 
 function statusLabel(entry) {
@@ -454,6 +498,18 @@ async function ensureAudioContext() {
 // design (this doesn't need symbol 0 to start at sample 0).
 const LEAD_IN_SILENCE_S = 0.3;
 
+// Extra hold after playback ends before the mic capture buffer resumes
+// accepting audio -- found live: a device with LISTEN left on while it
+// also sends (a lone user's normal usage, not just the two-tab test) has
+// its own mic pick up its own speaker's output, acoustically coupled on
+// the same machine, and "receive" its own transmission back as if it were
+// incoming. `playPcm` is the single choke point every send path (message
+// send, resend, calibrate probes, an automatic NACK-triggered resend) goes
+// through, so suppressing capture here covers all of them at once. The
+// tail beyond the buffer's own duration accounts for room reverb/echo
+// still ringing after the source node's `onended` fires.
+const CAPTURE_SUPPRESS_TAIL_S = 0.4;
+
 function playPcm(float32Samples, sampleRate) {
   return ensureAudioContext().then((ctx) => {
     return new Promise((resolve) => {
@@ -463,6 +519,8 @@ function playPcm(float32Samples, sampleRate) {
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
+      const durationMs = (buffer.length / sampleRate) * 1000;
+      suppressCaptureUntil = performance.now() + durationMs + CAPTURE_SUPPRESS_TAIL_S * 1000;
       src.onended = resolve;
       src.start();
     });
@@ -869,6 +927,7 @@ async function startCapture(onPoll) {
   const source = ctx.createMediaStreamSource(mediaStream);
   workletNode = new AudioWorkletNode(ctx, "capture-processor");
   workletNode.port.onmessage = (e) => {
+    if (performance.now() < suppressCaptureUntil) return; // ignore our own transmission -- see playPcm
     captureChunks.push(e.data);
     for (const v of e.data) {
       const a = Math.abs(v);
@@ -896,6 +955,7 @@ async function startCapture(onPoll) {
       scanPos = { phone: 0, fast_air: 0 };
       scanStuckSince = { phone: null, fast_air: null };
       calibrateScanPos = new Map();
+      calibrateStuckSince = new Map();
       return;
     }
     onPoll(normalizePeak(buffer));
@@ -1034,6 +1094,26 @@ function pollCalibrateCapture(buffer) {
         break;
       }
       if (!frame) break;
+
+      // Same truncation-vs-corruption distinction pollCapture makes (see
+      // its comments): a probe caught mid-transmission by a still-growing
+      // buffer must hold and retry rather than being treated as a genuine
+      // non-match and skipped past -- found live: without this, calibrate
+      // routinely reported "no match" for candidates that were actually
+      // fine, just caught mid-arrival, since this loop had no equivalent
+      // of pollCapture's hold-and-retry and eagerly advanced past every
+      // failed attempt regardless of cause.
+      if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
+        const stuckSince = calibrateStuckSince.get(key) ?? null;
+        if (stuckSince === null) calibrateStuckSince.set(key, Date.now());
+        if (Date.now() - (calibrateStuckSince.get(key) ?? Date.now()) < TRUNCATION_RETRY_TIMEOUT_MS) {
+          break; // leave pos where it was, retry this exact position next poll
+        }
+        calibrateStuckSince.set(key, null);
+      } else {
+        calibrateStuckSince.set(key, null);
+      }
+
       if (frame.ok && frame.text === code) {
         calibrateMatches.add(key);
         renderCalibrateResults();
@@ -1047,6 +1127,7 @@ function pollCalibrateCapture(buffer) {
 
 async function startCalibrateListening() {
   calibrateScanPos = new Map();
+  calibrateStuckSince = new Map();
   try {
     await startCapture(pollCalibrateCapture);
   } catch (e) {
