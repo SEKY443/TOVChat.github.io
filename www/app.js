@@ -9,12 +9,12 @@ import init, {
 
 const SR = 8000; // modem::SR -- outgoing PCM is always synthesized at this rate
 
-const STORAGE_USERNAME = "tovchat_username";
-const STORAGE_HISTORY = "tovchat_history";
+// Still persisted -- a device preference, not session content, unlike
+// username/history (see the "storage" section below).
 const STORAGE_MAX_RETRIES = "tovchat_max_retries";
 const MAX_USERNAME_CHARS = 16;
 const CHUNK_TEXT_CHARS = 700; // real-text budget per frame, leaving headroom for the envelope
-const MAX_HISTORY_ENTRIES = 300;
+const MAX_HISTORY_ENTRIES = 300; // in-memory cap for a long session, not a storage limit anymore
 const DEFAULT_MAX_RETRIES = 3;
 // Grace period after a message finishes playing before treating a missing
 // ack as "resend": long enough for the other side to finish decoding, build
@@ -136,41 +136,12 @@ window.addEventListener("error", (e) => showFatalError("SCRIPT ERROR", e.error |
 window.addEventListener("unhandledrejection", (e) => showFatalError("SCRIPT ERROR", e.reason));
 
 // ============================= storage =============================
-
-function loadUsername() {
-  try {
-    return localStorage.getItem(STORAGE_USERNAME) || "";
-  } catch (e) {
-    showFatalError("CANNOT READ LOCAL STORAGE", e);
-    return "";
-  }
-}
-
-function saveUsername(name) {
-  try {
-    localStorage.setItem(STORAGE_USERNAME, name);
-  } catch (e) {
-    showFatalError("CANNOT SAVE USERNAME (PRIVATE BROWSING / STORAGE BLOCKED?)", e);
-  }
-}
-
-function loadHistory() {
-  try {
-    const raw = localStorage.getItem(STORAGE_HISTORY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveHistory(history) {
-  try {
-    const trimmed = history.slice(-MAX_HISTORY_ENTRIES);
-    localStorage.setItem(STORAGE_HISTORY, JSON.stringify(trimmed));
-  } catch (e) {
-    showFatalError("CANNOT SAVE HISTORY (PRIVATE BROWSING / STORAGE BLOCKED?)", e);
-  }
-}
+//
+// Username and message history are deliberately NOT persisted -- this app
+// keeps no record of who you are or what you've sent/received beyond the
+// current tab's lifetime. exportData() (below, wired to the masthead's
+// "EXPORT" button) is the only way to keep any of it: it hands the user a
+// file to save themselves, on their own device, on their own terms.
 
 function loadMaxRetries() {
   try {
@@ -269,6 +240,7 @@ const gateError = document.getElementById("gate-error");
 const gateSubmit = document.getElementById("gate-submit");
 const appEl = document.getElementById("app");
 const whoamiEl = document.getElementById("whoami");
+const exportDataBtn = document.getElementById("export-data");
 const historyEl = document.getElementById("history");
 const textInput = document.getElementById("text-input");
 const sendKey = document.getElementById("send-key");
@@ -296,17 +268,14 @@ const micLevelDbEl = document.getElementById("mic-level-db");
 
 // ============================= state =============================
 
-let username = loadUsername();
-let history = loadHistory();
+let username = "";
+let history = [];
 // How many characters of each received message's text have already been
 // shown in its chat bubble -- lets renderEntry tell "this text just grew
-// live, animate the new part in" apart from "this is history loaded from
-// storage, show it instantly." Seeded below to each entry's full length so
-// a page load never replays the reveal for old messages.
+// live, animate the new part in" apart from "already fully shown, don't
+// replay the reveal." Nothing to seed at load: history starts empty every
+// visit (see the "storage" section), so every rx entry is genuinely new.
 const revealedChars = new Map(); // "rx:<id>" -> character count
-for (const h of history) {
-  if (h.dir === "rx") revealedChars.set(`rx:${h.id}`, h.text.length);
-}
 let selectedMode = "phone";
 let audioCtx = null;
 
@@ -517,7 +486,6 @@ function submitGate() {
       return;
     }
     username = name.trim();
-    saveUsername(username);
     gateError.hidden = true;
     showApp();
   } catch (e) {
@@ -533,6 +501,30 @@ whoamiEl.addEventListener("click", () => {
   gateInput.value = username;
   showGate();
 });
+
+/// Hands the user a file with everything this tab currently holds --
+/// username and full message history -- since none of it is kept any
+/// other way (see the "storage" section). Purely a local file save: the
+/// browser downloads it like any other file, nothing is sent anywhere.
+function exportData() {
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    username,
+    history,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  a.download = `tovchat-export-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+exportDataBtn.addEventListener("click", exportData);
 
 // ============================= audio context =============================
 
@@ -590,7 +582,7 @@ function playPcm(float32Samples, sampleRate) {
 
 function addHistoryEntry(entry) {
   history.push(entry);
-  saveHistory(history);
+  if (history.length > MAX_HISTORY_ENTRIES) history = history.slice(-MAX_HISTORY_ENTRIES);
   renderHistory();
 }
 
@@ -598,7 +590,6 @@ function updateHistoryEntry(id, dir, patch) {
   const entry = history.find((h) => h.id === id && h.dir === dir);
   if (!entry) return false;
   Object.assign(entry, patch);
-  saveHistory(history);
   renderHistory();
   return true;
 }
@@ -1387,11 +1378,7 @@ fileInput.addEventListener("change", async (ev) => {
 async function main() {
   try {
     await init();
-    if (!username) {
-      showGate();
-    } else {
-      showApp();
-    }
+    showGate(); // username is never remembered across visits -- always start here
   } catch (e) {
     showFatalError("FAILED TO LOAD (WASM MODULE)", e);
   }

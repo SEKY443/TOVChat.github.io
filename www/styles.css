@@ -154,6 +154,7 @@ button, input, textarea {
   cursor: pointer;
 }
 .whoami:hover { background: #191919; color: #f7f5ee; }
+.whoami-left { left: 0; right: auto; }
 .masthead-rule { border: none; border-top: 3px double #191919; margin: 8px 0 5px; }
 .masthead-sub { font-size: 9px; letter-spacing: 2.5px; color: #4a4a4a; padding-bottom: 12px; }
 

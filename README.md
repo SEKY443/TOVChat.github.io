@@ -15,11 +15,19 @@ typeface, telegraph/teletype aesthetic: message history ("paper") on top,
 a fixed inverted-black "machine" bar at the bottom holding the input and
 typewriter-key-styled controls.
 
-- **Username gate.** Required before the app is usable, stored locally.
-  Sent on every frame of every message via a small envelope —
+- **Username gate.** Required before the app is usable. Sent on every
+  frame of every message via a small envelope —
   `\x02<6-hex-char msg id>\x1F<username>\x03<text>` — so the receiving
   side sees a human name, not just a numeric SRC_ID (matters most for
   `group` mode, where several people share one channel).
+- **Nothing persists.** Username and message history live only in this
+  tab's memory — closing or reloading the page loses both, and neither is
+  ever written to `localStorage` (the only exception is the RETRIES
+  device setting, a preference, not session content). The masthead's
+  "▸ EXPORT" button is the only way to keep any of it: it downloads a
+  JSON file (username, full history, an export timestamp) to the user's
+  own device on demand — a real file save the browser handles, nothing
+  sent anywhere. No import path back in yet; exporting is one-way.
 - **Send.** Text is split into ≤700-character chunks, each tagged with
   the same message id + username, built into independently-addressed
   frames (`wasm/src/lib.rs`'s `encode_frames_to_pcm` — unlike
@@ -324,10 +332,10 @@ is the "who's this from" mechanism in the meantime.
 2. Addressing/contacts UI, encryption key exchange UX — each needs its
    own UX design before it's worth building.
 
-GitHub Pages is live at `https://seky443.github.io/TOVChat.github.io/`
+GitHub Pages is live at `https://seky443.github.io/TovChat/`
 (Settings → Pages → "Build and deployment source: GitHub Actions" is
 enabled) — a subpath, not the domain root, since the GitHub account is
-`SEKY443` not `TOVChat`; all asset paths are relative, already accounting
+`SEKY443` not `TovChat`; all asset paths are relative, already accounting
 for that. `.github/workflows/deploy.yml` builds the wasm module fresh and
 redeploys on every push to `main`.
 
