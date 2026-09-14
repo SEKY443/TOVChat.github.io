@@ -1,10 +1,9 @@
 import init, {
   encode_frames_to_pcm,
   scan_next_frame,
+  preview_frame,
   build_nack_pcm,
   scan_for_nack,
-  build_ack_pcm,
-  scan_for_ack,
 } from "./pkg/tovchat_wasm.js";
 
 const SR = 8000; // modem::SR -- outgoing PCM is always synthesized at this rate
@@ -59,6 +58,16 @@ const RETRY_ACK_GRACE_MS = 14000;
 const MSG_START = "\x02";
 const USERNAME_SEP = "\x1F";
 const MSG_SEP = "\x03";
+// Delivery-confirmation marker -- the real ASCII ACK control character
+// (0x06), not a spelled-out word, so an ack payload is as short as
+// possible: this one byte plus the id being confirmed, nothing else. Sent
+// through the exact same tagged-frame pipeline as an ordinary message, no
+// separate wire frame type -- see textovervoice-core's removal of the
+// previous custom AckFrame struct, after checking the actual
+// CLI-TextOverVoice reference implementation (chat.rs) showed its real ack
+// is exactly this shape: a short id-tagged text reply, not a dedicated
+// binary frame.
+const ACK_MARKER = "\x06";
 
 const LISTEN_MODES = ["phone", "fast_air"];
 const POLL_INTERVAL_MS = 1200;
@@ -95,26 +104,21 @@ const MEANINGFUL_FAILURES = new Map([
 const TYPEWRITER_CHAR_MS = 14;
 // Per-character "decode" flicker -- raw guessed bits settling into the
 // real 8-bit code, then resolving into the actual letter -- shown only in
-// the live-decode preview box (see typewriterReveal), never in a chat
-// bubble (see renderEntry). Skipped for whitespace (nothing interesting
-// to flicker through, and skipping keeps word-boundary pacing snappy).
-// Each call gets a `budgetMs` (see flickerInChar) derived from how long
-// the frame actually took to arrive (see LIVE_REVEAL_MIN/MAX_CHAR_MS
-// below), so the reveal genuinely tracks the real transmission instead of
-// an arbitrary canned animation, and stays fast for anything but a very
-// short frame.
+// the live-decode preview box (see revealTo), never in a chat bubble (see
+// renderEntry). Skipped for whitespace (nothing interesting to flicker
+// through, and skipping keeps word-boundary pacing snappy).
 const FLICKER_SKIP_THRESHOLD_MS = 16; // below this, no time to show anything but the resolved char
 const FLICKER_BITS_ONLY_THRESHOLD_MS = 40; // below this, skip the scrambled-guess phase, go straight to real bits
 const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
-// The live-decode box's reveal pace is derived per frame from how long
-// that frame actually took to arrive over the (real or simulated) air
-// (see pollCapture's frameDurationMs and typewriterReveal) -- these just
-// bound the per-character result so a frame with very few characters
-// over a long duration doesn't crawl, and a frame packed with characters
-// over a short duration doesn't blur past unreadable.
-const LIVE_REVEAL_MIN_CHAR_MS = 10;
-const LIVE_REVEAL_MAX_CHAR_MS = 70;
+// Per-character flicker duration for newly-arrived (or newly-corrected)
+// live-preview text. Fixed and short -- unlike an earlier version of this
+// box that derived pacing from a whole frame's total over-the-air
+// duration, real-time-ness here comes from WHEN a batch of characters
+// shows up (an actual poll, seeing actual new demodulated bytes via
+// preview_frame -- see updateLivePreview), not from how slowly this
+// flicker plays each one back once it has arrived.
+const LIVE_PREVIEW_CHAR_MS = 40;
 const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
@@ -392,7 +396,15 @@ const receivedMessageIds = new Set();
 
 let liveDecodeId = null; // message id currently shown in the live decode box
 let liveDecodeUsername = "";
-let liveDecodeRevealed = ""; // text already typewriter-revealed for liveDecodeId
+// Text already CONFIRMED (via a real, FEC/CRC-verified scan_next_frame
+// result) for liveDecodeId, across however many of its frames have
+// completed so far -- authoritative, never revised.
+let liveDecodeConfirmed = "";
+// Text currently on screen: liveDecodeConfirmed plus whatever the live,
+// pre-FEC preview (see updateLivePreview/preview_frame) has tentatively
+// shown for the frame still arriving. May differ from what eventually
+// gets confirmed -- see revealTo, which corrects it if so.
+let liveDecodeShown = "";
 let liveDecodeRevealToken = 0; // bumped to cancel an in-flight reveal when superseded
 let liveDecodeStatusRestoreTimer = null;
 
@@ -432,9 +444,9 @@ function renderEntry(entry) {
   const text = document.createElement("div");
   text.className = "slip-text";
   // The character-by-character decode flicker belongs only to the
-  // real-time preview box (see typewriterReveal) -- by the time a message
-  // is a chat bubble here, the decode already happened and was already
-  // watched happen there; replaying the animation on the bubble too was
+  // real-time preview box (see revealTo) -- by the time a message is a
+  // chat bubble here, the decode already happened and was already watched
+  // happen there; replaying the animation on the bubble too was
   // redundant, not informative.
   text.textContent = entry.text;
 
@@ -531,7 +543,7 @@ function scrambledBits(ch) {
 /// non-whitespace character, a scrambled 8-bit guess settling into the
 /// real 8-bit code then the resolved letter, each phase getting a slice
 /// of the budget; whitespace just appears, no flicker. Used only by
-/// `typewriterReveal` (the live-decode preview box) -- the chat bubble a
+/// `revealTo` (the live-decode preview box) -- the chat bubble a
 /// finished message ends up as (see renderEntry) shows its text plainly,
 /// no flicker, since the decode was already watched happen here. A tight
 /// budget (a long real message packed into a short transmission) degrades
@@ -877,14 +889,16 @@ function stopDeliveryRetry(id) {
 }
 
 /// Sends a delivery confirmation for a message this device just finished
-/// decoding. Best-effort and fire-and-forget from the caller's point of
-/// view (see `handleDecodedFrame`) -- a failed ack just means the sender's
-/// own retry timer eventually tries again or gives up, nothing to show the
-/// receiving side for that.
+/// decoding: the ACK byte plus the message id (see ACK_MARKER), sent as an
+/// ordinary short frame through the same pipeline as any other message --
+/// no separate wire frame type. Best-effort and fire-and-forget from the
+/// caller's point of view (see `handleDecodedFrame`) -- a failed ack just
+/// means the sender's own retry timer eventually tries again or gives up,
+/// nothing to show the receiving side for that.
 async function sendAckFor(id, mode) {
   dbg("ack-sent", id, mode);
   try {
-    const pcm = build_ack_pcm(mode, undefined, undefined, hexToBytes(id));
+    const pcm = encode_frames_to_pcm([ACK_MARKER + id], mode, undefined, undefined, undefined);
     await playPcm(pcm, SR);
   } catch (e) {
     dbg("ack-sent-failed", id, e);
@@ -1037,7 +1051,8 @@ function flashLiveDecodeStatus(text) {
 function resetLiveDecode() {
   liveDecodeId = null;
   liveDecodeUsername = "";
-  liveDecodeRevealed = "";
+  liveDecodeConfirmed = "";
+  liveDecodeShown = "";
   liveDecodeRevealToken++;
   liveDecodeTextEl.textContent = "";
   clearTimeout(liveDecodeStatusRestoreTimer);
@@ -1054,62 +1069,69 @@ function hideLiveDecode() {
   clearTimeout(liveDecodeStatusRestoreTimer);
 }
 
-// `onDone`, if given, only runs once the reveal actually reaches the end
-// of `fullText` (not if a newer reveal supersedes this one first) -- lets
-// a caller show "message complete" exactly when the visual decode process
-// the user is watching genuinely finishes, instead of the instant the
-// underlying frame decoded (found live: that used to fire a fixed
-// LIVE_DECODE_COMPLETE_HOLD_MS timer immediately on decode, which -- once
-// the per-character flicker made a full reveal take several seconds for
-// anything but a short message -- reliably wiped the box's text via
-// resetLiveDecode() while the reveal was still mid-flicker, looking like
-// the animation had simply stopped partway through).
-async function typewriterReveal(fullText, startAt, onDone, frameDurationMs = 0) {
-  const token = ++liveDecodeRevealToken;
-  const startedAt = performance.now();
-  const newChars = fullText.length - startAt;
-  // The frame's own real over-the-air duration (measured from actual
-  // sample positions in pollCapture, not guessed) spread across just the
-  // characters this frame added -- so a message that took 900ms to
-  // actually transmit reveals over roughly 900ms, and a long message
-  // packed into a short frame reveals fast rather than dragging out a
-  // fixed per-char delay well past when the real decode finished.
-  const perCharMs = newChars > 0
-    ? Math.min(LIVE_REVEAL_MAX_CHAR_MS, Math.max(LIVE_REVEAL_MIN_CHAR_MS, frameDurationMs / newChars))
-    : LIVE_REVEAL_MIN_CHAR_MS;
-  dbg("reveal-start", `${startAt}->${fullText.length} chars`, "token=" + token, "frameMs=" + Math.round(frameDurationMs), "perChar=" + perCharMs.toFixed(1) + "ms");
-  for (let i = startAt; i < fullText.length; i++) {
-    if (token !== liveDecodeRevealToken) {
-      dbg("reveal-superseded", "token=" + token, "at char", i, "of", fullText.length);
-      return;
-    }
-    await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i], perCharMs);
-  }
-  if (token === liveDecodeRevealToken) {
-    dbg("reveal-done", "token=" + token, Math.round(performance.now() - startedAt) + "ms");
-    if (onDone) onDone();
-  }
+/// Starts tracking a (possibly new) message in the live-decode box: resets
+/// confirmed/shown text and the on-screen element the moment `id` differs
+/// from whatever was previously showing. A no-op otherwise, so callers can
+/// call this unconditionally on every preview/confirmation without an
+/// `if (tag.id !== liveDecodeId)` check of their own.
+function ensureLiveDecodeTracking(id, username) {
+  if (id === liveDecodeId) return;
+  liveDecodeId = id;
+  liveDecodeUsername = username;
+  liveDecodeConfirmed = "";
+  liveDecodeShown = "";
+  liveDecodeTextEl.textContent = "";
 }
 
-function onLiveFrame(frame, onRevealDone, frameDurationMs) {
-  if (liveDecodeEl.hidden) return;
-  if (frame.ok) {
-    const tag = untagChunk(frame.text);
-    if (!tag) return;
-    if (tag.id !== liveDecodeId) {
-      liveDecodeId = tag.id;
-      liveDecodeUsername = tag.username;
-      liveDecodeRevealed = "";
-      liveDecodeTextEl.textContent = "";
-    }
-    clearTimeout(liveDecodeStatusRestoreTimer);
-    setLiveDecodeStatus(steadyLiveDecodeStatus());
-    const startAt = liveDecodeRevealed.length;
-    liveDecodeRevealed += tag.text;
-    typewriterReveal(liveDecodeRevealed, startAt, onRevealDone, frameDurationMs);
-  } else if (MEANINGFUL_FAILURES.has(frame.reason)) {
-    flashLiveDecodeStatus(`✕ ${MEANINGFUL_FAILURES.get(frame.reason)}`);
+/// Animates the live-decode box from whatever it currently shows
+/// (`liveDecodeShown`) to `targetText`, character by character via
+/// `flickerInChar`, then commits `liveDecodeShown = targetText`. Finds the
+/// first point the two diverge and re-flickers only from there onward --
+/// so ordinary growth (new preview characters appended at the end) just
+/// flickers the new tail in, while a correction (the confirmed, FEC/CRC-
+/// verified text turns out to differ from what the raw preview had
+/// tentatively shown -- see handleDecodedFrame) visibly re-resolves from
+/// wherever it was actually wrong, instead of silently snapping to the
+/// right answer.
+///
+/// `onDone`, if given, only runs once this reveal reaches the end of
+/// `targetText` (not if a newer call -- a fresher preview, or the real
+/// confirmation -- supersedes this one first, via the same token
+/// cancellation the box has always used) -- lets a caller show "message
+/// complete" exactly when the visual decode process the user is watching
+/// genuinely finishes, instead of the instant the underlying frame
+/// decoded (found live, before this box was preview-driven: firing that
+/// immediately, before a still-animating reveal had caught up, reliably
+/// wiped the box's text mid-flicker, looking like the animation had
+/// simply stopped partway through).
+async function revealTo(targetText, onDone) {
+  const token = ++liveDecodeRevealToken;
+  let matchLen = 0;
+  while (
+    matchLen < liveDecodeShown.length &&
+    matchLen < targetText.length &&
+    liveDecodeShown[matchLen] === targetText[matchLen]
+  ) {
+    matchLen++;
   }
+  dbg("reveal-start", "token=" + token, `${matchLen}->${targetText.length} chars`);
+  for (let i = matchLen; i < targetText.length; i++) {
+    if (token !== liveDecodeRevealToken) {
+      dbg("reveal-superseded", "token=" + token, "at char", i, "of", targetText.length);
+      return;
+    }
+    await flickerInChar(
+      (t) => { liveDecodeTextEl.textContent = t; },
+      targetText.slice(0, i),
+      targetText[i],
+      LIVE_PREVIEW_CHAR_MS
+    );
+  }
+  if (token !== liveDecodeRevealToken) return;
+  liveDecodeShown = targetText;
+  liveDecodeTextEl.textContent = targetText;
+  dbg("reveal-done", "token=" + token);
+  if (onDone) onDone();
 }
 
 function onLiveMessageComplete() {
@@ -1121,10 +1143,53 @@ function onLiveMessageComplete() {
   setTransientLiveDecodeStatus("✓ FEC OK · ✓ CRC OK · MESSAGE COMPLETE", LIVE_DECODE_COMPLETE_HOLD_MS, resetLiveDecode);
 }
 
-function handleDecodedFrame(frame, mode, frameDurationMs) {
-  if (!frame.ok) {
-    onLiveFrame(frame, undefined, frameDurationMs);
+/// Polls the live, pre-FEC preview (see `preview_frame`) for whatever
+/// frame is currently arriving at `scanPos[mode]`, and updates the
+/// live-decode box if there's anything new to show. Called every poll,
+/// independent of whether a frame has actually finished arriving yet --
+/// this is what makes the box genuinely real-time: characters appear as
+/// soon as they're demodulated from the growing capture buffer, not once
+/// an entire frame (or a fixed timer standing in for one) completes.
+///
+/// Deliberately non-authoritative, same caveat as `preview_frame` itself:
+/// what it shows can be wrong until `handleDecodedFrame`'s real,
+/// FEC/CRC-verified result confirms or corrects it.
+function updateLivePreview(mode) {
+  if (liveDecodeEl.hidden) return;
+  let preview;
+  try {
+    preview = preview_frame(captureBuffer.subarray(0, captureLength), captureSampleRate, mode, scanPos[mode], undefined);
+  } catch {
     return;
+  }
+  if (!preview || preview.text.startsWith(ACK_MARKER)) return; // nothing yet, or a delivery ack -- not a message to preview
+  const tag = untagChunk(preview.text);
+  if (!tag) return; // envelope (id/username) hasn't fully arrived yet
+
+  ensureLiveDecodeTracking(tag.id, tag.username);
+  clearTimeout(liveDecodeStatusRestoreTimer);
+  setLiveDecodeStatus(steadyLiveDecodeStatus());
+  const target = liveDecodeConfirmed + tag.text;
+  if (target !== liveDecodeShown) revealTo(target);
+}
+
+function handleDecodedFrame(frame, mode) {
+  if (!frame.ok) {
+    if (!liveDecodeEl.hidden && MEANINGFUL_FAILURES.has(frame.reason)) {
+      flashLiveDecodeStatus(`✕ ${MEANINGFUL_FAILURES.get(frame.reason)}`);
+    }
+    return;
+  }
+  if (frame.text.startsWith(ACK_MARKER)) {
+    // A delivery confirmation, not a real message -- see sendAckFor/
+    // ACK_MARKER. Never shown in the live-decode box, and doesn't warrant
+    // the full-buffer reset a completed message gets below (it's a tiny
+    // frame; pollCapture's normal next_start advancement is enough to
+    // move past it).
+    const targetId = frame.text.slice(ACK_MARKER.length);
+    dbg("ack-recv", "target=" + targetId);
+    markDelivered(targetId);
+    return false;
   }
   const tag = untagChunk(frame.text);
   if (!tag) return; // not one of ours (or a corrupted envelope) -- ignore, don't guess
@@ -1133,11 +1198,22 @@ function handleDecodedFrame(frame, mode, frameDurationMs) {
   // A resend the sender only sent because it never heard our first ack
   // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
   // identical to a genuinely new message here -- same id, same content,
-  // decoded clean. Computed before onLiveFrame so the "message complete"
+  // decoded clean. Computed before revealTo so the "message complete"
   // callback can be skipped for a duplicate the same way ringBell already
   // is, below.
   const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
-  onLiveFrame(frame, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined, frameDurationMs);
+
+  // Fold this frame's now-CONFIRMED (FEC/CRC-verified) text into the live
+  // box, correcting anything the raw preview had tentatively gotten wrong
+  // -- see revealTo/updateLivePreview.
+  if (!liveDecodeEl.hidden) {
+    ensureLiveDecodeTracking(tag.id, tag.username);
+    liveDecodeConfirmed += tag.text;
+    clearTimeout(liveDecodeStatusRestoreTimer);
+    setLiveDecodeStatus(steadyLiveDecodeStatus());
+    revealTo(liveDecodeConfirmed, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined);
+  }
+
   if (result.ok) {
     dbg("complete", tag.id, alreadyReceived ? "(duplicate resend)" : "(new)", JSON.stringify(result.text.slice(0, 60)));
     const updated = updateHistoryEntry(tag.id, "rx", {
@@ -1212,6 +1288,11 @@ async function handleNackFound(info) {
 
 async function pollCapture(buffer) {
   for (const mode of LISTEN_MODES) {
+    // Real-time decode preview: shows whatever's demodulated so far at the
+    // CURRENT scan position, independent of whether a frame below actually
+    // finishes arriving this poll -- see updateLivePreview.
+    updateLivePreview(mode);
+
     let pos = scanPos[mode];
     while (true) {
       let frame;
@@ -1223,11 +1304,6 @@ async function pollCapture(buffer) {
       if (!frame) break;
 
       dbg("scan", mode, "pos=" + pos, "ok=" + frame.ok, frame.ok ? "" : frame.reason, "next=" + frame.next_start);
-      // The frame's real span in the actual captured audio -- how long it
-      // genuinely took to arrive, preamble through CRC -- not an estimate.
-      // Feeds the live-decode reveal's pacing (see typewriterReveal) so it
-      // tracks the real transmission instead of an arbitrary fixed timer.
-      const frameDurationMs = ((frame.next_start - pos) / captureSampleRate) * 1000;
 
       if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
         if (scanStuckSince[mode] === null) scanStuckSince[mode] = Date.now();
@@ -1245,7 +1321,7 @@ async function pollCapture(buffer) {
         scanStuckSince[mode] = null;
       }
 
-      if (handleDecodedFrame(frame, mode, frameDurationMs)) return; // buffer was reset on completion -- stop, buffer/pos are gone
+      if (handleDecodedFrame(frame, mode)) return; // buffer was reset on completion -- stop, buffer/pos are gone
       pos = frame.next_start;
     }
     scanPos[mode] = pos;
@@ -1265,22 +1341,6 @@ async function pollCapture(buffer) {
       const targetId = Array.from(nack.target_id).map((b) => b.toString(16).padStart(2, "0")).join("");
       dbg("nack-recv", "target=" + targetId);
       await handleNackFound(nack);
-      resetCaptureBuffer();
-      return;
-    }
-
-    // Same no-position-tracking, rescans-the-whole-buffer shape as
-    // scan_for_nack above, for the same reason -- see its comment.
-    let ack;
-    try {
-      ack = scan_for_ack(buffer, captureSampleRate, mode);
-    } catch {
-      ack = null;
-    }
-    if (ack) {
-      const targetId = Array.from(ack.target_id).map((b) => b.toString(16).padStart(2, "0")).join("");
-      dbg("ack-recv", "target=" + targetId);
-      markDelivered(targetId);
       resetCaptureBuffer();
       return;
     }

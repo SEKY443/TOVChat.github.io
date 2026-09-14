@@ -249,6 +249,55 @@ typewriter-key-styled controls.
     "mic hearing something too quiet/unclean to demodulate" — this makes
     that distinction visible instead of needing an ad-hoc script to
     measure it.
+
+    **Found live: the readout wasn't actually real-time.** The binary-
+    flicker animation above played out over a fixed timer *after* a whole
+    frame had already fully decoded (FEC-corrected, CRC-verified) — a
+    polished-looking but entirely fake simulation of "watching it decode,"
+    not a report of what was actually happening to the signal as it
+    arrived. Digging into the actual
+    [CLI-TextOverVoice](https://github.com/SEKY443/CLI-TextOverVoice)
+    reference implementation (`live.rs`) confirmed the CLI has the same
+    limitation — it's poll-and-retry against a growing buffer, not true
+    per-symbol streaming — so there was nothing to port; this needed a
+    real new capability. `textovervoice-core` gained
+    `preview_frame_protected`: once a frame's small RS-protected header
+    has resolved (fast — a handful of symbols), it decodes whatever raw
+    payload bytes have arrived *so far* directly, skipping FEC correction
+    and CRC verification entirely. This works because the RS coding here
+    is systematic (data bytes travel as-is; parity is appended
+    separately, never mixed in) — on a clean channel the raw bytes already
+    equal what the real, verified decode will eventually produce, so this
+    preview is usually correct *immediately*, not simulated. The wasm
+    layer exposes it as `preview_frame`, called every poll (alongside, not
+    instead of, `scan_next_frame`) at the same scan position — new
+    characters appear the moment they're actually demodulated from a
+    still-growing buffer, not once an artificial timer elapses.
+
+    Because this preview is explicitly non-authoritative, the readout now
+    tells the honest version of the story: the flicker plays out on
+    whatever's newly arrived each poll, and once a frame's real,
+    FEC/CRC-verified result lands, it's diffed against what was tentatively
+    shown — if they match, nothing visible changes; if a genuine channel
+    error made the preview guess wrong somewhere, that's exactly where the
+    correction re-flickers from, resolving into the real text instead of
+    silently snapping to it. This is the literal answer to "if it's wrong
+    and CRC fixes it, show that too."
+- **Ack redesign**: the delivery-confirmation ack used to be its own
+  binary wire frame (`AckFrame`, mirroring `NackFrame`'s RS-protected
+  5-byte header) — but checking the actual CLI-TextOverVoice reference
+  implementation (`chat.rs`) showed its real ack mechanism is much
+  lighter: an ordinary short text message, tagged with the id being
+  confirmed, sent through the exact same encode/decode pipeline as any
+  other frame (the reserved `codes::ACK`/`NACK` wire values the CLI
+  defines are never actually used for this). `AckFrame` is gone from
+  `textovervoice-core` entirely; an ack here is now just the real ASCII
+  ACK control byte (`0x06`, not the CLI's spelled-out `"ACK:"` text)
+  followed by the message id — e.g. `\x06d944b5` — built and recognized
+  directly by the JS app (`sendAckFor`/`handleDecodedFrame`) using the
+  same `encode_frames_to_pcm`/`scan_next_frame` path an ordinary message
+  uses. Shorter on the wire, less code, and consistent with how the
+  reference implementation actually solves this.
 - **Resend**, three ways:
   - A sent message always gets a local one-click resend (replays from
     its stored chunks/settings, no audio round trip needed).
@@ -264,10 +313,11 @@ typewriter-key-styled controls.
     resend matters most. **Automatic delivery retry** (below) fixes that
     by having the sender drive retry instead.
   - **Automatic delivery retry**: sending a message starts a retry cycle
-    — listen for a new `AckFrame` (mirrors `NackFrame`'s wire structure;
-    see `textovervoice-core`) naming that message's id, and if none
-    arrives within a grace period after the message finishes playing,
-    resend automatically. Unlike request-resend, this needs nothing from
+    — listen for a short ack (the real ASCII ACK control byte, `0x06`,
+    plus the message id, sent as an ordinary tagged frame — see "Ack
+    redesign" below) naming that message's id, and if none arrives within
+    a grace period after the message finishes playing, resend
+    automatically. Unlike request-resend, this needs nothing from
     the receiver but successfully decoding and sending back one short ack
     — works even when the *first* attempt was never heard at all. Every
     successful `handleDecodedFrame` completion now fires one of these
