@@ -76,6 +76,23 @@ typewriter-key-styled controls.
     narrow (~0.5–0.7s) window where a header genuinely split across a
     poll boundary might need a manual resend, in exchange for never
     blocking real signal detection on a noise blip again.
+
+    **Third round, also found live**: still unreliable — worked several
+    times, then failed again. Root cause: the captured buffer was never
+    trimmed after a successful decode, only ever growing (up to a hard
+    40s safety cap). Once that cap was hit, the code wiped the buffer but
+    left `scanPos` (and the new `scanStuckSince`) pointing at a position
+    from the old, now-discarded buffer — silently breaking all further
+    detection, since every future poll starts scanning from a position
+    the tiny fresh buffer hasn't grown long enough to even reach yet. Now
+    the buffer resets (position trackers included) immediately after
+    every successful decode, not just on overflow, so the cap becomes a
+    true just-in-case fallback instead of something a real listening
+    session routinely reaches. Verified with a full two-message session
+    simulation against the compiled `.wasm` binary: message 1 decodes,
+    the buffer is confirmed near-empty right after (not left growing),
+    and message 2 — sent later in the same session — also decodes
+    correctly, which is exactly the scenario the bug broke.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is

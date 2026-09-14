@@ -689,6 +689,22 @@ function handleDecodedFrame(frame, mode) {
     }
     onLiveMessageComplete();
     ringBell();
+    // The buffer is never trimmed as it's consumed (only ever grows, up
+    // to the hard MAX_BUFFER_SECONDS cap), so without this a long
+    // listening session keeps re-materializing and re-scanning an
+    // ever-larger buffer on every poll, and eventually hits that cap --
+    // which used to leave scanPos stale relative to the freshly-emptied
+    // buffer, silently breaking all further detection (found live: "works
+    // a few times, then fails" was this). Clearing right after a full
+    // message completes keeps the buffer bounded in normal use, so the
+    // cap becomes a true just-in-case fallback instead of something
+    // routinely hit. Signal the reset back to the caller (pollCapture) so
+    // it stops scanning THIS poll cycle immediately, matching the
+    // existing NACK-handling pattern -- continuing with the local `pos`/
+    // `buffer` it already had would silently undo this reset the moment
+    // it writes scanPos[mode] = pos at the end of its loop.
+    resetCaptureBuffer();
+    return true;
   } else {
     const patch = {
       status: "incomplete",
@@ -702,6 +718,7 @@ function handleDecodedFrame(frame, mode) {
       addHistoryEntry({ id: tag.id, dir: "rx", mode, time: Date.now(), ...patch });
     }
   }
+  return false;
 }
 
 function resetCaptureBuffer() {
@@ -743,7 +760,7 @@ async function pollCapture(buffer) {
         scanStuckSince[mode] = null;
       }
 
-      handleDecodedFrame(frame, mode);
+      if (handleDecodedFrame(frame, mode)) return; // buffer was reset on completion -- stop, buffer/pos are gone
       pos = frame.next_start;
     }
     scanPos[mode] = pos;
@@ -836,7 +853,15 @@ async function startCapture(onPoll) {
     if (captureChunks.length === 0) return;
     const buffer = materializeCaptureBuffer();
     if (buffer.length > MAX_BUFFER_SECONDS * captureSampleRate) {
+      // Reset every position-tracker this shared capture loop could be
+      // feeding (normal listening's, calibrate-listen's), not just
+      // captureChunks -- whichever one is currently active, leaving its
+      // scan position stale relative to the now-empty buffer reproduces
+      // the exact bug this is fixing, just for that mode instead.
       captureChunks = [];
+      scanPos = { phone: 0, fast_air: 0 };
+      scanStuckSince = { phone: null, fast_air: null };
+      calibrateScanPos = new Map();
       return;
     }
     onPoll(normalizePeak(buffer));
