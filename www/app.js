@@ -83,16 +83,15 @@ const MEANINGFUL_FAILURES = new Map([
 ]);
 const TYPEWRITER_CHAR_MS = 14;
 // Per-character "decode" flicker -- raw guessed bits settling into the
-// real 8-bit code, then resolving into the actual letter -- shown before
-// a character locks in, in both the live-decode preview box and a chat
-// bubble's reveal. Skipped for whitespace (nothing interesting to flicker
-// through, and skipping keeps word-boundary pacing snappy). Each call
-// gets a `budgetMs` (see flickerInChar) -- the chat bubble uses a fixed
-// default, but the live-decode box derives it from how long the frame
-// actually took to arrive (see LIVE_REVEAL_MIN/MAX_CHAR_MS below), so the
-// reveal genuinely tracks the real transmission instead of an arbitrary
-// canned animation, and stays fast for anything but a very short frame.
-const FLICKER_DEFAULT_BUDGET_MS = 55; // chat-bubble reveal, no real-time duration to derive from
+// real 8-bit code, then resolving into the actual letter -- shown only in
+// the live-decode preview box (see typewriterReveal), never in a chat
+// bubble (see renderEntry). Skipped for whitespace (nothing interesting
+// to flicker through, and skipping keeps word-boundary pacing snappy).
+// Each call gets a `budgetMs` (see flickerInChar) derived from how long
+// the frame actually took to arrive (see LIVE_REVEAL_MIN/MAX_CHAR_MS
+// below), so the reveal genuinely tracks the real transmission instead of
+// an arbitrary canned animation, and stays fast for anything but a very
+// short frame.
 const FLICKER_SKIP_THRESHOLD_MS = 16; // below this, no time to show anything but the resolved char
 const FLICKER_BITS_ONLY_THRESHOLD_MS = 40; // below this, skip the scrambled-guess phase, go straight to real bits
 const LIVE_DECODE_FLASH_MS = 2500;
@@ -345,12 +344,6 @@ const micLevelDbEl = document.getElementById("mic-level-db");
 
 let username = "";
 let history = [];
-// How many characters of each received message's text have already been
-// shown in its chat bubble -- lets renderEntry tell "this text just grew
-// live, animate the new part in" apart from "already fully shown, don't
-// replay the reveal." Nothing to seed at load: history starts empty every
-// visit (see the "storage" section), so every rx entry is genuinely new.
-const revealedChars = new Map(); // "rx:<id>" -> character count
 let selectedMode = "phone";
 let audioCtx = null;
 
@@ -426,18 +419,12 @@ function renderEntry(entry) {
 
   const text = document.createElement("div");
   text.className = "slip-text";
-  if (entry.dir === "rx") {
-    const key = `rx:${entry.id}`;
-    const already = revealedChars.get(key) ?? 0;
-    if (already >= entry.text.length) {
-      text.textContent = entry.text;
-    } else {
-      text.textContent = entry.text.slice(0, already);
-      animateEntryReveal(text, entry.text, already, key);
-    }
-  } else {
-    text.textContent = entry.text;
-  }
+  // The character-by-character decode flicker belongs only to the
+  // real-time preview box (see typewriterReveal) -- by the time a message
+  // is a chat bubble here, the decode already happened and was already
+  // watched happen there; replaying the animation on the bubble too was
+  // redundant, not informative.
+  text.textContent = entry.text;
 
   slip.append(head, text);
 
@@ -503,16 +490,15 @@ function charBits(ch) {
 /// given the full text-so-far) within `budgetMs` total -- for a
 /// non-whitespace character, a scrambled 8-bit guess settling into the
 /// real 8-bit code then the resolved letter, each phase getting a slice
-/// of the budget; whitespace just appears, no flicker. Shared by
-/// `animateEntryReveal` (a chat bubble, fixed budget) and
-/// `typewriterReveal` (the live-decode preview box, budget derived from
-/// the frame's real over-the-air duration) so both reveals look and feel
-/// the same, just paced differently. A tight budget (a long real message
-/// packed into a short transmission) degrades gracefully: skip the
-/// scrambled-guess phase first, then skip straight to the resolved
-/// character -- staying fast and legible instead of stretching the
-/// animation past what the budget actually allows.
-async function flickerInChar(setText, prefix, ch, budgetMs = FLICKER_DEFAULT_BUDGET_MS) {
+/// of the budget; whitespace just appears, no flicker. Used only by
+/// `typewriterReveal` (the live-decode preview box) -- the chat bubble a
+/// finished message ends up as (see renderEntry) shows its text plainly,
+/// no flicker, since the decode was already watched happen here. A tight
+/// budget (a long real message packed into a short transmission) degrades
+/// gracefully: skip the scrambled-guess phase first, then skip straight
+/// to the resolved character -- staying fast and legible instead of
+/// stretching the animation past what the budget actually allows.
+async function flickerInChar(setText, prefix, ch, budgetMs) {
   if (ch.trim() === "") {
     setText(prefix + ch);
     await sleep(Math.min(budgetMs, TYPEWRITER_CHAR_MS));
@@ -537,28 +523,6 @@ async function flickerInChar(setText, prefix, ch, budgetMs = FLICKER_DEFAULT_BUD
   await sleep(budgetMs * 0.3);
   setText(prefix + ch);
   await sleep(budgetMs * 0.4);
-}
-
-/// Reveals `fullText` into `el` one character at a time (via
-/// `flickerInChar`), starting from `startAt` (already-shown) characters,
-/// recording progress in `revealedChars` as it goes -- so a message the
-/// live poll is still filling in (multi-frame) or that renderHistory()
-/// happens to re-render mid-reveal (a full-list rebuild, no incremental
-/// DOM diffing here) picks up from wherever it actually got to, in the
-/// real chat bubble, rather than the text just appearing all at once the
-/// moment a frame completes.
-async function animateEntryReveal(el, fullText, startAt, key) {
-  let i = startAt;
-  while (i < fullText.length) {
-    await flickerInChar((t) => { el.textContent = t; }, fullText.slice(0, i), fullText[i]);
-    // A newer render of the same bubble (or a reset/overwrite) may have
-    // moved reveal progress on without this loop's help -- never regress
-    // past what's already been recorded or shown elsewhere.
-    if ((revealedChars.get(key) ?? 0) > i) i = revealedChars.get(key);
-    i++;
-    revealedChars.set(key, i);
-    el.textContent = fullText.slice(0, i);
-  }
 }
 
 function statusLabel(entry) {
