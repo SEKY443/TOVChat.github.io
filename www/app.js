@@ -78,10 +78,27 @@ const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak 
 // they're safe to always wait out.
 const TRUNCATION_REASONS = new Set([
   "unexpected end of frame", // Legacy header read hit EOF -- unambiguous, no FEC step to conflate with
+  "unexpected end of frame reading protected header", // ran out of tokens, not an RS failure -- see below
   "payload extends past end of received data", // ProtectedHeader, header already validated
   "unexpected end of frame reading parity",
   "unexpected end of frame reading CRC",
 ]);
+// Found live: the header's own truncation case ("unexpected end of frame
+// reading protected header") used to collapse into the same string as a
+// genuinely uncorrectable header ("protected header FEC uncorrectable"),
+// so it couldn't safely be added here -- a live poll catching a real
+// transmission mid-header looked identical to real corruption. Now that
+// textovervoice-core reports it as its own distinct reason (a pure "ran
+// out of tokens" fact, only reachable when there truly isn't enough
+// buffered audio yet -- never from a complete-but-corrupt header, so it's
+// exactly as safe to retry as the other reasons here), it belongs in this
+// set: a live-captured header cut short by buffer boundaries was silently
+// reported as a hard failure and permanently skipped, even though the
+// rest of the transmission arrived moments later and decoded cleanly.
+// "protected header FEC uncorrectable" itself stays excluded -- still
+// ambiguous, still reachable by a noise-triggered false preamble with a
+// complete (if garbage) trailing buffer.
+//
 // Generous: since these reasons are now provably tied to a real, already-
 // synced transmission, the bound only needs to comfortably cover the
 // longest realistic message in the slowest mode, not guard against noise.
@@ -1122,77 +1139,6 @@ fileInput.addEventListener("change", async (ev) => {
     }
   }
 });
-
-// ============================= init =============================
-
-// TEMPORARY diagnostic hook (remove once the HEADER FEC investigation is
-// done): exposes the raw live-capture buffer for offline analysis against
-// the compiled core -- console.error, not .log, so it survives whatever
-// log-level filter is active.
-window.__tovDiag = {
-  dumpCapture() {
-    const total = captureChunks.reduce((n, c) => n + c.length, 0);
-    const merged = new Float32Array(total);
-    let off = 0;
-    for (const c of captureChunks) {
-      merged.set(c, off);
-      off += c.length;
-    }
-    const i16 = new Int16Array(merged.length);
-    for (let i = 0; i < merged.length; i++) {
-      const s = Math.max(-1, Math.min(1, merged[i]));
-      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    const bytes = new Uint8Array(i16.buffer);
-    let bin = "";
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return { sampleRate: captureSampleRate, samples: merged.length, base64: btoa(bin) };
-  },
-  downloadCapture() {
-    const total = captureChunks.reduce((n, c) => n + c.length, 0);
-    const merged = new Float32Array(total);
-    let off = 0;
-    for (const c of captureChunks) {
-      merged.set(c, off);
-      off += c.length;
-    }
-    const i16 = new Int16Array(merged.length);
-    for (let i = 0; i < merged.length; i++) {
-      const s = Math.max(-1, Math.min(1, merged[i]));
-      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    const dataSize = i16.length * 2;
-    const buf = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buf);
-    const ws = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
-    ws(0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    ws(8, "WAVE");
-    ws(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, captureSampleRate, true);
-    view.setUint32(28, captureSampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    ws(36, "data");
-    view.setUint32(40, dataSize, true);
-    new Int16Array(buf, 44).set(i16);
-    const blob = new Blob([buf], { type: "audio/wav" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "tov-capture-diag.wav";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    return { samples: merged.length, sampleRate: captureSampleRate, bytes: buf.byteLength };
-  },
-};
 
 // ============================= init =============================
 

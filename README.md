@@ -135,6 +135,50 @@ typewriter-key-styled controls.
     at the protocol level, not a live-only hypothesis — but like every
     wire-format change in this project, it still needs a real acoustic
     retest to confirm it actually moves the needle on real hardware.
+
+    **Sixth round, and the actual root cause**: raising the header's FEC
+    budget didn't help — `HEADER FEC: UNCORRECTABLE` kept appearing almost
+    every send. Rather than keep guessing at the acoustic layer, a
+    temporary `window.__tovDiag` hook was added to pull the *exact* raw
+    PCM a failing live session had captured out of the browser (as a WAV
+    download) for offline analysis against the compiled core directly.
+    Decoding that captured audio standalone — the identical
+    `find_preamble` → `demodulate` → `parse_frame` pipeline
+    `scan_next_frame` uses, just run natively instead of through wasm —
+    decoded it perfectly. The signal was never bad. The bug was in
+    [`textovervoice-core`](https://github.com/SEKY443/textovervoice-core)'s
+    error reporting: `read_protected_header` returned the same `None` (and
+    therefore the same `"protected header FEC uncorrectable"` string) both
+    when a complete header failed RS correction *and* when the reader
+    simply ran out of tokens because a live capture buffer, still growing
+    mid-transmission, hadn't reached the end of the header yet. Every
+    other frame region (payload/parity/CRC) already reports its own
+    distinct `"unexpected end of frame reading ..."` for exactly this
+    ambiguity — the header was the one region that never got it. Since
+    `app.js`'s `TRUNCATION_REASONS` set (the "hold and retry instead of
+    reporting a hard failure" list — see the first round above)
+    deliberately excluded `"protected header FEC uncorrectable"` as
+    ambiguous, a header caught mid-arrival was reported as a hard failure
+    and the scanner permanently skipped past it — even though the rest of
+    that same transmission's audio arrived moments later and would have
+    decoded cleanly, exactly as the offline replay proved.
+
+    Fixed by giving the header its own truncation-vs-corruption
+    distinction: `read_protected_header` now returns a `HeaderRead` enum
+    (`Ok`/`Truncated`/`Uncorrectable`) instead of collapsing both failure
+    modes into `Option::None`, so a truncated read reports the new, exact
+    `"unexpected end of frame reading protected header"` — safe to add to
+    `TRUNCATION_REASONS` since (unlike the RS-failure case) it's a pure
+    "not enough buffered audio yet" fact, never reachable from a complete-
+    but-corrupt header. `protected header FEC uncorrectable` itself stays
+    excluded, still correctly ambiguous. Verified two ways against the
+    compiled core: a new unit test asserts the two cases now produce
+    different reasons from the same frame (one truncated, one corrupted);
+    and, more concretely, feeding the decoder a version of the *actual
+    failing user's captured audio* truncated to stop mid-header reproduces
+    the exact new reason string, while the full, untruncated capture
+    decodes the message correctly — closing the loop from a real reported
+    failure to a proven, targeted fix.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is
