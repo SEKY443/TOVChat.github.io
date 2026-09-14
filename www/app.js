@@ -777,12 +777,7 @@ async function pollCapture(buffer) {
       } catch {
         break;
       }
-      if (!frame) {
-        console.error(`[TOVDBG] ${mode} pos=${pos} no frame (preamble not found past pos), buflen=${buffer.length}`);
-        break;
-      }
-
-      console.error(`[TOVDBG] ${mode} pos=${pos} ok=${frame.ok} reason=${JSON.stringify(frame.reason)} next_start=${frame.next_start} buflen=${buffer.length}`);
+      if (!frame) break;
 
       if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
         if (scanStuckSince[mode] === null) scanStuckSince[mode] = Date.now();
@@ -790,7 +785,6 @@ async function pollCapture(buffer) {
           // Leave pos where it was -- don't report this as a failure, and
           // retry this exact position next poll once more of the
           // transmission has arrived, rather than skipping past it.
-          console.error(`[TOVDBG] ${mode} holding at pos=${pos}, stuck for ${Date.now() - scanStuckSince[mode]}ms`);
           break;
         }
         // Waited long enough that this is more likely genuine corruption
@@ -1147,16 +1141,6 @@ fileInput.addEventListener("change", async (ev) => {
 });
 
 // ============================= init =============================
-
-// TEMPORARY read-only introspection hook, removed once the long-message
-// live-polling investigation concludes.
-window.__tovState = () => ({
-  scanPos: { ...scanPos },
-  scanStuckSince: { ...scanStuckSince },
-  bufferSamples: captureChunks.reduce((n, c) => n + c.length, 0),
-  captureSampleRate,
-  liveDecodeId,
-});
 
 async function main() {
   try {

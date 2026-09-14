@@ -179,6 +179,21 @@ typewriter-key-styled controls.
     the exact new reason string, while the full, untruncated capture
     decodes the message correctly — closing the loop from a real reported
     failure to a proven, targeted fix.
+
+    **Automated acoustic self-test, post-fix**: rather than rely solely on
+    another round of phone-in-hand testing, five messages spanning the
+    format's edge cases (a short word, a full sentence, CJK text, emoji,
+    and a longer message forcing more than one RS block) were synthesized
+    to real PCM with the compiled core, played through this machine's own
+    speaker, and picked up by the deployed site's real microphone input —
+    an actual acoustic round trip, not a loopback shortcut. All five
+    decoded correctly. The longer message's *first* attempt appeared to
+    hang with no result — traced to the browser tab being backgrounded
+    (this machine's display went to sleep mid-test), which Chrome
+    throttles `setInterval` polling under; the queued polls caught up and
+    decoded correctly the moment the tab was active again, confirming the
+    truncation-retry logic tolerates irregular poll timing correctly, not
+    just the nominal 1.2s cadence.
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is
