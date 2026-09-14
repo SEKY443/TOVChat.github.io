@@ -39,6 +39,15 @@
   </div>
 
   <div class="machine">
+    <!-- Real-time decode readout: shown while LISTEN is active. Reveals
+         each incoming frame's text as it decodes (typewriter effect) and
+         reports the FEC/CRC (and, if applicable, decrypt) outcome for
+         every frame, success or failure -- not just the final message. -->
+    <div id="live-decode" class="live-decode" hidden>
+      <div class="live-decode-status" id="live-decode-status">&#9642; AWAITING SIGNAL &#9642;</div>
+      <div class="live-decode-text" id="live-decode-text"></div>
+    </div>
+
     <div class="carriage-label">
       <span id="carriage-status">&#9642; TYPE YOUR MESSAGE &#9642;</span>
     </div>

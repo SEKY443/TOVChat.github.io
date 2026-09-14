@@ -42,6 +42,20 @@ typewriter-key-styled controls.
     each poll.
   - **File upload**, for testing without two devices/a real acoustic
     path.
+  - **Real-time decode readout**, shown above the input while LISTEN is
+    active: a typewriter-style reveal of each incoming frame's text as it
+    decodes, plus the FEC/CRC (and decrypt, if a frame turns out to be
+    encrypted) outcome for *every* frame attempt — success or failure —
+    not just the final message. Reuses `scan_next_frame`'s `reason`
+    string (exact strings from `protocol.rs`'s `ParseResult::fail`/
+    `fail_with`) to distinguish a genuine corrupted-frame attempt (FEC
+    uncorrectable, CRC mismatch, encrypted-with-no-key) from a preamble
+    false-triggering on plain noise, so it doesn't flash false alarms
+    during ordinary idle listening. A message-complete hold and a
+    failure flash share one timer rather than two independent ones —
+    found and fixed a real race live-testing this: two separate timers
+    let a completion's reset fire mid-flash and cut a later failure
+    notice short.
 - **Resend**, both directions:
   - A sent message always gets a local one-click resend (replays from
     its stored chunks/settings, no audio round trip needed).

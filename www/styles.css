@@ -230,6 +230,34 @@ button, input, textarea {
   border-top: 2px solid #f7f5ee;
 }
 
+.live-decode[hidden] { display: none; }
+
+.live-decode {
+  border: 2px solid #f7f5ee;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+
+.live-decode-status {
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: #b9b4a8;
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.live-decode-text {
+  font-size: 15px;
+  line-height: 1.4;
+  min-height: 1.4em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.live-decode-text::after {
+  content: "\258C";
+  animation: blink 1s steps(2, jump-none) infinite;
+}
+
 .carriage-label {
   font-size: 9px;
   letter-spacing: 3px;

@@ -36,6 +36,23 @@ const CALIBRATE_CANDIDATES = [
 ];
 const CALIBRATE_PROBE_GAP_MS = 500; // matches calibrate.rs's inter-probe gap
 
+// Exact strings protocol::parse_frame's ParseResult::fail/fail_with use
+// (see textovervoice-core's protocol.rs) for a frame that genuinely made
+// it far enough to be a real (if corrupted) data-frame attempt -- as
+// opposed to a preamble false-triggering on plain noise, which fails much
+// earlier with a structural reason not in this map. Shown live so the
+// FEC/CRC/decrypt verification is actually visible, not just the final
+// text -- mapped to a short display label for the readout.
+const MEANINGFUL_FAILURES = new Map([
+  ["FEC uncorrectable", "FEC: UNCORRECTABLE"],
+  ["CRC mismatch after FEC", "CRC: MISMATCH"],
+  ["protected header FEC uncorrectable", "HEADER FEC: UNCORRECTABLE"],
+  ["frame is encrypted but no session key was provided", "ENCRYPTED — NO KEY TO DECRYPT"],
+]);
+const TYPEWRITER_CHAR_MS = 18;
+const LIVE_DECODE_FLASH_MS = 2500;
+const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
+
 // ============================= fatal error display =============================
 
 // Any uncaught error here previously meant the page just silently did
@@ -192,6 +209,10 @@ const calibrateSendBtn = document.getElementById("calibrate-send");
 const calibrateListenBtn = document.getElementById("calibrate-listen");
 const calibrateResultsEl = document.getElementById("calibrate-results");
 
+const liveDecodeEl = document.getElementById("live-decode");
+const liveDecodeStatusEl = document.getElementById("live-decode-status");
+const liveDecodeTextEl = document.getElementById("live-decode-text");
+
 // ============================= state =============================
 
 let username = loadUsername();
@@ -211,6 +232,12 @@ let pollTimer = null;
 let calibrating = false;
 let calibrateScanPos = new Map(); // "mode:parity" -> sample offset
 let calibrateMatches = new Set(); // "mode:parity" already reported
+
+let liveDecodeId = null; // message id currently shown in the live decode box
+let liveDecodeUsername = "";
+let liveDecodeRevealed = ""; // text already typewriter-revealed for liveDecodeId
+let liveDecodeRevealToken = 0; // bumped to cancel an in-flight reveal when superseded
+let liveDecodeStatusRestoreTimer = null;
 
 // ============================= rendering =============================
 
@@ -480,7 +507,97 @@ function materializeCaptureBuffer() {
   return merged;
 }
 
+// ============================= live decode readout =============================
+//
+// Drives the box shown above the input while LISTEN is active: a
+// typewriter-style reveal of each incoming frame's text as it decodes,
+// plus the FEC/CRC/decrypt outcome for every frame attempt -- success or
+// failure -- not just the final assembled message.
+
+function steadyLiveDecodeStatus() {
+  return liveDecodeId
+    ? `● RECEIVING · ${liveDecodeUsername} · #${liveDecodeId}  [FEC ✓] [CRC ✓]`
+    : "▪ AWAITING SIGNAL ▪";
+}
+
+function setLiveDecodeStatus(text) {
+  liveDecodeStatusEl.textContent = text;
+}
+
+// A single shared timer for "the next thing that overwrites this status
+// line" -- a failure flash and a just-completed message's hold both need
+// one of these, and if they used independent timers, whichever was
+// scheduled first could fire in the middle of the other and stomp it
+// early (confirmed while testing: a completion's reset firing partway
+// through a later failure flash cut the flash short). One timer means
+// whichever transient status was shown LAST always owns however long it
+// was supposed to display for.
+function setTransientLiveDecodeStatus(text, holdMs, onExpire) {
+  setLiveDecodeStatus(text);
+  clearTimeout(liveDecodeStatusRestoreTimer);
+  liveDecodeStatusRestoreTimer = setTimeout(onExpire, holdMs);
+}
+
+function flashLiveDecodeStatus(text) {
+  setTransientLiveDecodeStatus(text, LIVE_DECODE_FLASH_MS, () => setLiveDecodeStatus(steadyLiveDecodeStatus()));
+}
+
+function resetLiveDecode() {
+  liveDecodeId = null;
+  liveDecodeUsername = "";
+  liveDecodeRevealed = "";
+  liveDecodeRevealToken++;
+  liveDecodeTextEl.textContent = "";
+  clearTimeout(liveDecodeStatusRestoreTimer);
+  setLiveDecodeStatus("▪ AWAITING SIGNAL ▪");
+}
+
+function showLiveDecode() {
+  liveDecodeEl.hidden = false;
+  resetLiveDecode();
+}
+
+function hideLiveDecode() {
+  liveDecodeEl.hidden = true;
+  clearTimeout(liveDecodeStatusRestoreTimer);
+}
+
+async function typewriterReveal(fullText, startAt) {
+  const token = ++liveDecodeRevealToken;
+  for (let i = startAt; i <= fullText.length; i++) {
+    if (token !== liveDecodeRevealToken) return; // superseded by a newer reveal
+    liveDecodeTextEl.textContent = fullText.slice(0, i);
+    await sleep(TYPEWRITER_CHAR_MS);
+  }
+}
+
+function onLiveFrame(frame) {
+  if (liveDecodeEl.hidden) return;
+  if (frame.ok) {
+    const tag = untagChunk(frame.text);
+    if (!tag) return;
+    if (tag.id !== liveDecodeId) {
+      liveDecodeId = tag.id;
+      liveDecodeUsername = tag.username;
+      liveDecodeRevealed = "";
+      liveDecodeTextEl.textContent = "";
+    }
+    clearTimeout(liveDecodeStatusRestoreTimer);
+    setLiveDecodeStatus(steadyLiveDecodeStatus());
+    const startAt = liveDecodeRevealed.length;
+    liveDecodeRevealed += tag.text;
+    typewriterReveal(liveDecodeRevealed, startAt);
+  } else if (MEANINGFUL_FAILURES.has(frame.reason)) {
+    flashLiveDecodeStatus(`✕ ${MEANINGFUL_FAILURES.get(frame.reason)}`);
+  }
+}
+
+function onLiveMessageComplete() {
+  setTransientLiveDecodeStatus("✓ MESSAGE COMPLETE", LIVE_DECODE_COMPLETE_HOLD_MS, resetLiveDecode);
+}
+
 function handleDecodedFrame(frame, mode) {
+  onLiveFrame(frame);
   if (!frame.ok) return;
   const tag = untagChunk(frame.text);
   if (!tag) return; // not one of ours (or a corrupted envelope) -- ignore, don't guess
@@ -507,6 +624,7 @@ function handleDecodedFrame(frame, mode) {
         framesExpected: result.framesExpected,
       });
     }
+    onLiveMessageComplete();
     ringBell();
   } else {
     const patch = {
@@ -627,6 +745,7 @@ async function startListening() {
   listenKey.classList.add("listening");
   listenKey.textContent = "LISTENING";
   setCarriageStatus("● LISTENING…");
+  showLiveDecode();
 }
 
 function stopListening() {
@@ -635,6 +754,7 @@ function stopListening() {
   listenKey.textContent = "LISTEN";
   setCarriageStatus("▢ TYPE YOUR MESSAGE ▢");
   stopCapture();
+  hideLiveDecode();
 }
 
 listenKey.addEventListener("click", () => {
