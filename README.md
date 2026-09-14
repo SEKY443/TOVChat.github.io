@@ -41,24 +41,42 @@ pending a visual-direction review, see below).
   round-trip (including scanning past a preceding data frame to find a
   later NACK, and rejecting a malformed target id cleanly) against the
   compiled `.wasm` binary.
+- **Sender username, design confirmed and validated (not yet wired into a
+  UI — see below).** Required before the app is usable (local onboarding
+  gate, stored in the browser). Matters most for `group` mode: several
+  people share one broadcast channel, and without a transmitted name
+  every message would show only a bare numeric SRC_ID. Envelope:
+  `\x02<6-hex-char msg id>\x1F<username>\x03<real text>` — reuses the
+  same plain-ASCII-control-character technique as the resend message id
+  (rides through charset/dictionary encoding as ordinary payload data, no
+  wire/protocol change). Username capped at 16 characters, rejected (not
+  silently truncated) when set. Round-trip verified against the compiled
+  `.wasm` binary: ASCII and Unicode usernames, the 16-char boundary,
+  over-cap rejection, and no interference with dictionary word
+  compression. SRC_ID keeps its existing protocol-level role (FEC-
+  protected, used for addressing/filtering) — username is a payload-level,
+  human-readable enrichment on top, with the same "unauthenticated,
+  spoofable, no server to enforce uniqueness" caveat SRC_ID already has.
 
 ## What's next
 
 Per the project brief (see `NEXT_AGENT_WEB_PROMPT.md`), still pending
 before the real UI gets built:
 
-1. **Visual design** — strictly black-and-white, Special Elite typeface,
-   "looks crude but is actually carefully designed" telegraph/teletype
-   aesthetic. 2-3 direction sketches to be reviewed before the real build.
+1. **Visual design — decided.** Strictly black-and-white, Special Elite
+   typeface, telegraph/teletype aesthetic. Direction: message history
+   ("paper") at the top, input ("the machine" — text slot + PHONE/FAST
+   AIR/TRANSMIT styled as typewriter keys) fixed in an inverted black bar
+   at the bottom of the screen.
 2. Live mic/speaker I/O via `AudioWorkletNode` (currently only
    offline/file-based encode-decode is validated).
-3. The real UI: send/listen, message history with resend, the bell sound
-   on transfer complete (`bell_sound.wav`, CC0/public domain), real-time
-   streaming decode display, and the send-side wiring for the NACK
-   primitive above (per-frame message-id tagging on send, local resend
-   history, auto-retransmit on hearing a known id) — deliberately left for
-   the real UI/app-state work rather than bolted on ahead of the visual
-   design.
+3. The real UI: send/listen, the username gate above, message history
+   with resend, the bell sound on transfer complete (`bell_sound.wav`,
+   CC0/public domain), real-time streaming decode display, and the
+   send-side wiring for the NACK primitive above (per-frame message-id
+   tagging on send, local resend history, auto-retransmit on hearing a
+   known id) — deliberately left for the real UI/app-state work rather
+   than bolted on ahead of the visual design.
 4. GitHub Pages deployment via Actions
    (`actions/upload-pages-artifact` + `actions/deploy-pages`). Note: this
    repo is served at `https://seky443.github.io/TOVChat.github.io/` (a
