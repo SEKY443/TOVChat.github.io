@@ -515,7 +515,7 @@ dependencies = [
 [[package]]
 name = "textovervoice-core"
 version = "0.1.0"
-source = "git+https://github.com/SEKY443/textovervoice-core#5715863d61879d2a495edf3a01e748ac19817b91"
+source = "git+https://github.com/SEKY443/textovervoice-core#4b8d8d09c17299a3d14caa76d26fa6c41d8ec491"
 dependencies = [
  "anyhow",
  "chacha20poly1305",

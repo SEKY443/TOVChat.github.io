@@ -164,6 +164,40 @@ fn scan_for_preamble(audio: &[f64], start: usize, reference: &[f64], sr: u32) ->
     None
 }
 
+/// Shared by [`scan_next_frame`] and [`preview_frame`]: finds the next
+/// preamble at or after `start_sample` and demodulates however many
+/// symbols of payload are currently available (capped at
+/// [`MAX_SYMBOLS_PER_FRAME`]) into raw wire-code bytes -- everything both
+/// callers need before they diverge on what to do with those bytes. One
+/// waits for a complete, FEC/CRC-verified frame; the other reports
+/// whatever's demodulated so far, live.
+fn demodulate_candidate(
+    audio: &[f64],
+    start_sample: usize,
+    profile: &modem::ModeProfile,
+    sr: u32,
+    reference: &[f64],
+) -> Option<(usize, usize, Vec<u8>)> {
+    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
+    let (abs_offset, _score) = scan_for_preamble(audio, start_sample, reference, sr)?;
+    let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
+    let available = audio.len().saturating_sub(payload_start);
+    let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
+
+    let detections = modem::demodulate(
+        &audio[payload_start..],
+        n_symbols,
+        profile.symbol_duration_s,
+        profile.guard_s,
+        sr,
+        0,
+    );
+    let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
+    let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
+    let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
+    Some((abs_offset, payload_start, frame_codes))
+}
+
 /// Decodes 32-bit float PCM samples (mono) captured/produced at `sample_rate`
 /// Hz back into text. `my_id`, when given, filters to frames addressed to
 /// that id (broadcast frames still match). `session_key` must match
@@ -389,129 +423,14 @@ pub fn scan_for_nack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Op
     Ok(None)
 }
 
-/// A parsed delivery confirmation, as returned by [`scan_for_ack`].
-/// `target_id` names which sent message it confirms -- callers correlate it
-/// against whatever id they tagged their own sent messages with, the same
-/// way [`NackInfo`] does.
-#[wasm_bindgen]
-pub struct AckInfo {
-    dest_id: u8,
-    src_id: u8,
-    target_id: Vec<u8>,
-}
-
-#[wasm_bindgen]
-impl AckInfo {
-    #[wasm_bindgen(getter)]
-    pub fn dest_id(&self) -> u8 {
-        self.dest_id
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn src_id(&self) -> u8 {
-        self.src_id
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn target_id(&self) -> Vec<u8> {
-        self.target_id.clone()
-    }
-}
-
-/// Encodes a delivery-confirmation signal (see `protocol::AckFrame`) into
-/// PCM. Same shape as [`build_nack_pcm`] -- short, no payload, no FEC
-/// budget beyond the 5-byte header's own protection.
-#[wasm_bindgen]
-pub fn build_ack_pcm(
-    mode: &str,
-    dest_id: Option<u8>,
-    src_id: Option<u8>,
-    target_id: &[u8],
-) -> Result<Vec<f32>, JsValue> {
-    let profile = resolve_mode(mode)?;
-    let target_id = parse_target_id(target_id)?;
-
-    let frame_codes = protocol::build_ack_frame(&protocol::AckFrame {
-        dest_id: dest_id.unwrap_or(BROADCAST_ID),
-        src_id: src_id.unwrap_or(UNKNOWN_SRC_ID),
-        target_id,
-    });
-    let symbols = modem::bytes_to_symbols(&frame_codes);
-    let audio = modem::modulate_frame(&symbols, profile.symbol_duration_s, profile.guard_s, modem::SR);
-    Ok(audio.into_iter().map(|s| s as f32).collect())
-}
-
-/// Scans `samples` for the first delivery-confirmation signal, ignoring any
-/// ordinary data or NACK frames encountered along the way. Same structure
-/// and same "`None` means none found yet, not an error" contract as
-/// [`scan_for_nack`].
-#[wasm_bindgen]
-pub fn scan_for_ack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Option<AckInfo>, JsValue> {
-    let profile = resolve_mode(mode)?;
-    let sr = sample_rate;
-    let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
-
-    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
-    let preamble_len_n = (modem::PREAMBLE_DURATION_S * sr as f64) as usize;
-    if step_n == 0 || preamble_len_n == 0 {
-        return Err(JsValue::from_str(&format!(
-            "unusable sample rate ({sr}Hz) for the requested timing -- expected something close \
-             to {}Hz",
-            modem::SR
-        )));
-    }
-
-    let reference = modem::generate_preamble(
-        modem::PREAMBLE_DURATION_S,
-        modem::PREAMBLE_F0,
-        modem::PREAMBLE_F1,
-        sr,
-    );
-    let mut search_start = 0usize;
-
-    while search_start < audio.len() {
-        let Some((abs_offset, _score)) = scan_for_preamble(&audio, search_start, &reference, sr)
-        else {
-            break;
-        };
-        let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
-        let available = audio.len().saturating_sub(payload_start);
-        let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
-
-        let detections = modem::demodulate(
-            &audio[payload_start..],
-            n_symbols,
-            profile.symbol_duration_s,
-            profile.guard_s,
-            sr,
-            0,
-        );
-        let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
-        let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
-        let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
-
-        if let Some(ack) = protocol::parse_ack_frame(&frame_codes) {
-            return Ok(Some(AckInfo {
-                dest_id: ack.dest_id,
-                src_id: ack.src_id,
-                target_id: ack.target_id.to_vec(),
-            }));
-        }
-
-        if let Some(consumed_codes) =
-            protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
-        {
-            let consumed_symbols = (consumed_codes * 8).div_ceil(6);
-            let exact_end = payload_start + consumed_symbols * step_n;
-            search_start =
-                payload_start.max(exact_end.saturating_sub((PREAMBLE_BACKOFF_S * sr as f64) as usize));
-        } else {
-            search_start = abs_offset + preamble_len_n;
-        }
-    }
-
-    Ok(None)
-}
+// Delivery acks are no longer a separate binary frame type (see
+// textovervoice-core's removal of AckFrame) -- checking the actual
+// CLI-TextOverVoice reference implementation showed the real mechanism is
+// just a short ordinary text message (an id prefixed with an ACK marker),
+// sent through the exact same encode/decode path as any other frame. The
+// web app builds and recognizes that short text directly in JS now
+// (see sendAckFor/handleDecodedFrame in app.js) -- nothing wasm-specific
+// needed here anymore.
 
 /// Encodes `chunks` as a sequence of independently-addressed frames (one
 /// per chunk, `seq` = index, `more_frames` = not the last one) -- unlike
@@ -690,25 +609,11 @@ pub fn scan_next_frame(
         sr,
     );
 
-    let Some((abs_offset, _score)) = scan_for_preamble(&audio, start_sample, &reference, sr)
+    let Some((abs_offset, payload_start, frame_codes)) =
+        demodulate_candidate(&audio, start_sample, &profile, sr, &reference)
     else {
         return Ok(None);
     };
-    let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
-    let available = audio.len().saturating_sub(payload_start);
-    let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
-
-    let detections = modem::demodulate(
-        &audio[payload_start..],
-        n_symbols,
-        profile.symbol_duration_s,
-        profile.guard_s,
-        sr,
-        0,
-    );
-    let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
-    let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
-    let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
 
     let next_start = match protocol::frame_wire_length(&frame_codes, 0, parity_bytes) {
         Some(consumed_codes) => {
@@ -744,5 +649,121 @@ pub fn scan_next_frame(
         seq: result.seq,
         more_frames: result.more_frames,
         next_start,
+    }))
+}
+
+/// One frame's live, non-authoritative preview, as returned by
+/// [`preview_frame`] -- see `protocol::FramePreview`'s doc comment for
+/// exactly what "non-authoritative" means here and why it's still useful
+/// for a real-time decode readout.
+#[wasm_bindgen]
+pub struct FramePreview {
+    text: String,
+    src_id: u8,
+    seq: u8,
+    more_frames: bool,
+    bytes_seen: usize,
+    declared_len: usize,
+}
+
+#[wasm_bindgen]
+impl FramePreview {
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> String {
+        self.text.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn src_id(&self) -> u8 {
+        self.src_id
+    }
+    #[wasm_bindgen(getter)]
+    pub fn seq(&self) -> u8 {
+        self.seq
+    }
+    #[wasm_bindgen(getter)]
+    pub fn more_frames(&self) -> bool {
+        self.more_frames
+    }
+    /// How many of `declared_len` raw payload wire bytes have actually
+    /// arrived so far -- lets a caller show real progress (and know how
+    /// much of `text` to trust as "at least demodulated," as opposed to
+    /// text that will still grow on the next poll).
+    #[wasm_bindgen(getter)]
+    pub fn bytes_seen(&self) -> usize {
+        self.bytes_seen
+    }
+    #[wasm_bindgen(getter)]
+    pub fn declared_len(&self) -> usize {
+        self.declared_len
+    }
+}
+
+/// Live, best-effort preview of whatever frame starts at or after
+/// `start_sample` -- built directly from raw demodulated symbols, before
+/// FEC correction or CRC verification, possibly before the frame has even
+/// finished arriving. See `protocol::preview_frame_protected`'s doc
+/// comment for exactly what this does and doesn't guarantee (short
+/// version: usually correct immediately on a clean channel, since this
+/// crate's RS coding is systematic, but not authoritative -- a caller
+/// should always treat [`scan_next_frame`]'s eventual FEC/CRC-verified
+/// result as the correction/confirmation of whatever this showed).
+///
+/// Meant to be called every poll at the SAME `start_sample` a caller's
+/// next `scan_next_frame` call will use, against a still-growing buffer --
+/// unlike `scan_next_frame`, this never needs a complete frame and never
+/// advances any position itself (nothing here is consumed/committed).
+/// Returns `None` if there's no preamble yet, the header hasn't resolved
+/// yet, or (see `preview_frame_protected`) this particular frame isn't
+/// previewable at all (`Legacy` format, encrypted, or not addressed to
+/// `my_id`).
+#[wasm_bindgen]
+pub fn preview_frame(
+    samples: &[f32],
+    sample_rate: u32,
+    mode: &str,
+    start_sample: usize,
+    my_id: Option<u8>,
+) -> Result<Option<FramePreview>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let sr = sample_rate;
+    let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
+
+    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
+    let preamble_len_n = (modem::PREAMBLE_DURATION_S * sr as f64) as usize;
+    if step_n == 0 || preamble_len_n == 0 {
+        return Err(JsValue::from_str(&format!(
+            "unusable sample rate ({sr}Hz) for the requested timing -- expected something close \
+             to {}Hz",
+            modem::SR
+        )));
+    }
+    if start_sample >= audio.len() {
+        return Ok(None);
+    }
+
+    let reference = modem::generate_preamble(
+        modem::PREAMBLE_DURATION_S,
+        modem::PREAMBLE_F0,
+        modem::PREAMBLE_F1,
+        sr,
+    );
+
+    let Some((_abs_offset, _payload_start, frame_codes)) =
+        demodulate_candidate(&audio, start_sample, &profile, sr, &reference)
+    else {
+        return Ok(None);
+    };
+
+    let Some(preview) = protocol::preview_frame_protected(&frame_codes, true, my_id) else {
+        return Ok(None);
+    };
+
+    Ok(Some(FramePreview {
+        text: preview.text,
+        src_id: preview.src_id,
+        seq: preview.seq,
+        more_frames: preview.more_frames,
+        bytes_seen: preview.bytes_seen,
+        declared_len: preview.declared_len,
     }))
 }
