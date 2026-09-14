@@ -421,11 +421,23 @@ async function ensureAudioContext() {
   return audioCtx;
 }
 
+// A silent lead-in before the real signal starts -- found live: repeated
+// real (non-truncation) "HEADER FEC: UNCORRECTABLE" failures, specifically
+// on the header, which is the very first thing sent right after the
+// preamble. That points at something settling right at the start of
+// playback -- autoGainControl adapting from silence to a loud tone,
+// speaker reaching steady output, room reflections stabilizing -- landing
+// squarely on the header instead of later in the transmission. Safe to
+// add: the receiver already tolerates arbitrary leading silence by
+// design (this doesn't need symbol 0 to start at sample 0).
+const LEAD_IN_SILENCE_S = 0.3;
+
 function playPcm(float32Samples, sampleRate) {
   return ensureAudioContext().then((ctx) => {
     return new Promise((resolve) => {
-      const buffer = ctx.createBuffer(1, float32Samples.length, sampleRate);
-      buffer.copyToChannel(float32Samples, 0);
+      const leadIn = Math.round(LEAD_IN_SILENCE_S * sampleRate);
+      const buffer = ctx.createBuffer(1, leadIn + float32Samples.length, sampleRate);
+      buffer.copyToChannel(float32Samples, 0, leadIn);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);

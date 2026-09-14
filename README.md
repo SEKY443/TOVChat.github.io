@@ -93,6 +93,23 @@ typewriter-key-styled controls.
     the buffer is confirmed near-empty right after (not left growing),
     and message 2 — sent later in the same session — also decodes
     correctly, which is exactly the scenario the bug broke.
+
+    **Fourth round**: after that fix, failures were finally genuine and
+    visible instead of silent — the readout reported a real, repeated
+    `"HEADER FEC: UNCORRECTABLE"`, specifically on the header, the very
+    first thing sent right after the preamble. That points at something
+    settling right at playback's *start* rather than a code bug: the
+    `autoGainControl` enabled earlier adapting from silence to a loud
+    tone, the speaker reaching steady output, room reflections
+    stabilizing — all landing squarely on the header instead of later in
+    the transmission. Added a 0.3s silent lead-in before every
+    transmission (`playPcm`) so that settling happens before the header
+    starts, not during it — safe to add since the receiver already
+    tolerates arbitrary leading silence by design. This one is a
+    hypothesis, not a proven root cause the way the previous three were
+    (Node can confirm the receiver still decodes correctly with the added
+    silence, which it does, but not whether it actually fixes real
+    hardware timing — that needs another live test).
   - **File upload**, for testing without two devices/a real acoustic
     path.
   - **Real-time decode readout**, shown above the input while LISTEN is
