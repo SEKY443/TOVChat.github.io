@@ -288,7 +288,12 @@ function renderHistory() {
   for (const entry of history) {
     historyEl.appendChild(renderEntry(entry));
   }
-  historyEl.scrollTop = historyEl.scrollHeight;
+  // Deferred to the next frame: reading scrollHeight immediately after
+  // the DOM mutations above can race the browser's layout pass and scroll
+  // by less than the full new height, especially for a taller entry.
+  requestAnimationFrame(() => {
+    historyEl.scrollTop = historyEl.scrollHeight;
+  });
 }
 
 function renderEntry(entry) {
