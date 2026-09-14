@@ -327,6 +327,16 @@ typewriter-key-styled controls.
     during that jitter — so multiple devices all finding the channel idle
     at the same moment get staggered instead of firing together.
 
+    **Found live with a third device**: even with the jitter fix above,
+    testing with three tabs (one sender, two receivers both decoding the
+    same broadcast) still occasionally triggered an unneeded resend.
+    Cause: `RETRY_ACK_GRACE_MS` was tuned before contention jitter
+    existed, and never accounted for it — with two receivers deliberately
+    staggering their acks against each other, the genuinely-successful
+    round trip can now take noticeably longer than before, and the old
+    grace period didn't leave room for that extra, intentional delay.
+    Raised from 10s to 14s to cover it.
+
     **Also found live**: replying quickly still sometimes rang the bell
     twice for what was clearly one message. Cause: `RETRY_ACK_GRACE_MS`
     (6s) was tight enough that a completely successful delivery could
@@ -366,6 +376,29 @@ typewriter-key-styled controls.
   equivalent and eagerly advanced past every failed attempt regardless of
   cause. Now shares the same `TRUNCATION_REASONS` hold-and-retry logic,
   keyed per candidate instead of per mode.
+- **Decode flicker, real-time preview box only**: the character flicker
+  (scrambled guesses → real byte code → resolved letter) used to replay a
+  second time on a received message's finished chat bubble, on top of
+  already having played once in the live-decode preview box moments
+  earlier — repeating, with extra delay, something the user had just
+  watched happen. A message in history is just history now: its bubble
+  renders the text immediately, no animation. The flicker itself belongs
+  to the live-decode box alone.
+
+  **Found live sending Chinese text**: the flicker's "real bits" step
+  used `codePointAt(0) & 0xff` — the code point's low byte — which is a
+  correct 8-bit code for ASCII/Latin-1 but silently discards everything
+  above 0xFF for anything wider, so a CJK character's "decode" flickered
+  through a value with no relationship to the character at all. Now it
+  encodes the character to its real UTF-8 bytes and, for anything wider
+  than one byte, shows the actual hex bytes joined by `-` (the same role
+  UTF-8's own continuation-byte marker plays) and capped with `×` once
+  the sequence for that character is complete — e.g. 漢 flickers through
+  `E6-BC-A2×` before resolving. ASCII is unchanged (still 8-bit binary).
+  Still not a literal reconstruction of this app's actual wire bytes
+  (those depend on charset/dictionary compression this layer doesn't have
+  visibility into) — but now an honest encoding of the character itself
+  instead of a value with no meaning.
 
 - **Self-hearing, found live**: a device with LISTEN on while it also
   sends — completely normal single-device usage, not just the two-tab

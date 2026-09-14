@@ -43,7 +43,18 @@ const DEFAULT_MAX_RETRIES = 3;
 // which the *receiver* then decodes a second time, ringing the bell twice
 // for what the user rightly hears as one message (see handleDecodedFrame's
 // alreadyReceived check, the other half of that fix).
-const RETRY_ACK_GRACE_MS = 10000;
+//
+// Raised again, from 10s to 14s, after adding mandatory contention jitter
+// to every ack transmission (see CARRIER_SENSE_MAX_WAIT_MS/
+// CARRIER_SENSE_JITTER_*_MS below): with three devices live, two receivers
+// decoding the same broadcast at the same instant now each deliberately
+// wait out carrier-sense contention -- up to CARRIER_SENSE_MAX_WAIT_MS in
+// the worst case -- before their acks actually go out. That's exactly the
+// same "outrun the grace period" failure mode as before, just with the
+// collision-avoidance wait itself as the new dominant cost instead of
+// decode/poll latency -- the fix is the same, give the round trip enough
+// room to actually finish.
+const RETRY_ACK_GRACE_MS = 14000;
 
 const MSG_START = "\x02";
 const USERNAME_SEP = "\x1F";
@@ -477,13 +488,41 @@ function renderEntry(entry) {
   return slip;
 }
 
+const utf8Encoder = new TextEncoder();
+
+/// The character's real encoded bytes -- for a single-byte (ASCII/Latin-1)
+/// character, its 8-bit binary, same as before. For anything wider (CJK,
+/// emoji, accented characters outside Latin-1 -- multiple UTF-8 bytes per
+/// character), `ch.codePointAt(0) & 0xff` used to silently discard every
+/// bit above the low byte, showing a meaningless flicker for exactly the
+/// characters where "watch it decode" mattered most -- found live sending
+/// Chinese text, where the box never showed anything resembling a real
+/// decode step. Now it shows the character's actual UTF-8 bytes in hex,
+/// joined by "-" (marking a continuation byte, same idea as UTF-8's own
+/// 10xxxxxx continuation-byte marker) and capped with "×" as the
+/// terminator once the full sequence for this one character is shown.
+/// Still not a literal reconstruction of this app's actual wire bytes
+/// (which depend on charset/dictionary compression this layer doesn't
+/// have visibility into) -- but now at least an honest, real encoding of
+/// the character itself, not a value with no meaning at all.
 function charBits(ch) {
-  // Just the low byte of the code point -- a plausible-looking "raw data"
-  // flicker, not a literal reconstruction of this app's actual wire bytes
-  // (which depend on charset/dictionary compression and UTF-8 boundary
-  // encoding this layer doesn't have visibility into). Good enough for the
-  // effect it's going for: bits settling into a letter.
-  return (ch.codePointAt(0) & 0xff).toString(2).padStart(8, "0");
+  const bytes = utf8Encoder.encode(ch);
+  if (bytes.length === 1) {
+    return bytes[0].toString(2).padStart(8, "0");
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join("-") + "×";
+}
+
+/// A scrambled guess in the same shape charBits(ch) would resolve to --
+/// same byte count, same hex/binary formatting -- so the flicker settles
+/// from "plausible-looking guess" to "real bytes" without the shape
+/// itself jumping partway through.
+function scrambledBits(ch) {
+  const byteCount = utf8Encoder.encode(ch).length;
+  if (byteCount === 1) {
+    return Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
+  }
+  return Array.from({ length: byteCount }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0").toUpperCase()).join("-") + "×";
 }
 
 /// Reveals one more character onto `prefix` via `setText` (a callback
@@ -516,8 +555,7 @@ async function flickerInChar(setText, prefix, ch, budgetMs) {
     await sleep(budgetMs * 0.5);
     return;
   }
-  const scrambled = Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
-  setText(prefix + scrambled);
+  setText(prefix + scrambledBits(ch));
   await sleep(budgetMs * 0.3);
   setText(prefix + charBits(ch));
   await sleep(budgetMs * 0.3);
