@@ -249,3 +249,139 @@ pub fn decode_from_pcm(
         "decode failed: message incomplete (ran out of audio or preambles)",
     ))
 }
+
+/// A parsed resend request, as returned by [`scan_for_nack`]. `target_id`
+/// is the 3-byte id (see `protocol::NackFrame`) naming which message to
+/// resend -- callers correlate it against whatever id they tagged their
+/// own sent messages with.
+#[wasm_bindgen]
+pub struct NackInfo {
+    dest_id: u8,
+    src_id: u8,
+    target_id: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl NackInfo {
+    #[wasm_bindgen(getter)]
+    pub fn dest_id(&self) -> u8 {
+        self.dest_id
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn src_id(&self) -> u8 {
+        self.src_id
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn target_id(&self) -> Vec<u8> {
+        self.target_id.clone()
+    }
+}
+
+fn parse_target_id(target_id: &[u8]) -> Result<[u8; 3], JsValue> {
+    <[u8; 3]>::try_from(target_id)
+        .map_err(|_| JsValue::from_str(&format!(
+            "target_id must be exactly 3 bytes, got {}",
+            target_id.len()
+        )))
+}
+
+/// Encodes a resend-request signal (see `protocol::NackFrame`) into PCM.
+/// Deliberately much shorter than a data message -- no payload, no FEC
+/// budget beyond the 5-byte header's own protection -- since it only needs
+/// to say "please resend id X".
+#[wasm_bindgen]
+pub fn build_nack_pcm(
+    mode: &str,
+    dest_id: Option<u8>,
+    src_id: Option<u8>,
+    target_id: &[u8],
+) -> Result<Vec<f32>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let target_id = parse_target_id(target_id)?;
+
+    let frame_codes = protocol::build_nack_frame(&protocol::NackFrame {
+        dest_id: dest_id.unwrap_or(BROADCAST_ID),
+        src_id: src_id.unwrap_or(UNKNOWN_SRC_ID),
+        target_id,
+    });
+    let symbols = modem::bytes_to_symbols(&frame_codes);
+    let audio = modem::modulate_frame(&symbols, profile.symbol_duration_s, profile.guard_s, modem::SR);
+    Ok(audio.into_iter().map(|s| s as f32).collect())
+}
+
+/// Scans `samples` for the first resend-request signal, ignoring any
+/// ordinary data frames encountered along the way (their preambles are
+/// found and skipped past just like `decode_from_pcm` does, they're just
+/// not what this function is looking for). Returns `None` if none is
+/// found before the audio runs out -- a caller checks for a NACK on
+/// received audio the same defensive way it checks for a decodable
+/// message, never assuming one is present.
+#[wasm_bindgen]
+pub fn scan_for_nack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Option<NackInfo>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let sr = sample_rate;
+    let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
+
+    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
+    let preamble_len_n = (modem::PREAMBLE_DURATION_S * sr as f64) as usize;
+    if step_n == 0 || preamble_len_n == 0 {
+        return Err(JsValue::from_str(&format!(
+            "unusable sample rate ({sr}Hz) for the requested timing -- expected something close \
+             to {}Hz",
+            modem::SR
+        )));
+    }
+
+    let reference = modem::generate_preamble(
+        modem::PREAMBLE_DURATION_S,
+        modem::PREAMBLE_F0,
+        modem::PREAMBLE_F1,
+        sr,
+    );
+    let mut search_start = 0usize;
+
+    while search_start < audio.len() {
+        let Some((abs_offset, _score)) = scan_for_preamble(&audio, search_start, &reference, sr)
+        else {
+            break;
+        };
+        let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
+        let available = audio.len().saturating_sub(payload_start);
+        let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
+
+        let detections = modem::demodulate(
+            &audio[payload_start..],
+            n_symbols,
+            profile.symbol_duration_s,
+            profile.guard_s,
+            sr,
+            0,
+        );
+        let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
+        let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
+        let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
+
+        if let Some(nack) = protocol::parse_nack_frame(&frame_codes) {
+            return Ok(Some(NackInfo {
+                dest_id: nack.dest_id,
+                src_id: nack.src_id,
+                target_id: nack.target_id.to_vec(),
+            }));
+        }
+
+        if let Some(consumed_codes) =
+            protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
+        {
+            let consumed_symbols = (consumed_codes * 8).div_ceil(6);
+            let exact_end = payload_start + consumed_symbols * step_n;
+            search_start =
+                payload_start.max(exact_end.saturating_sub((PREAMBLE_BACKOFF_S * sr as f64) as usize));
+        } else {
+            search_start = abs_offset + preamble_len_n;
+        }
+    }
+
+    Ok(None)
+}

@@ -10,9 +10,10 @@ No backend server — encode/decode/send/receive all happen in the browser.
 
 ## Status
 
-**Phase 1 (this commit): WASM build + offline encode/decode, validated.**
-No UI yet — `www/index.html` is a bare functional test harness, not the
-real design (that's still pending a visual-direction review, see below).
+**Phase 1: WASM build + offline encode/decode, validated. Resend/NACK
+protocol primitive: implemented and tested.** No UI yet — `www/index.html`
+is a bare functional test harness, not the real design (that's still
+pending a visual-direction review, see below).
 
 - [`wasm/`](wasm) — a `wasm-bindgen` crate exposing `encode_to_pcm`/
   `decode_from_pcm` (raw `f32` PCM in/out) over
@@ -29,26 +30,36 @@ real design (that's still pending a visual-direction review, see below).
   wrong-key rejection, multi-frame reassembly, and clean-failure paths for
   noise-only and NaN-filled input) run against the actual compiled `.wasm`
   binary.
+- `build_nack_pcm`/`scan_for_nack` — a resend request ("please resend
+  message X") as a real wire-level frame (`protocol::NackFrame` in
+  textovervoice-core), not another ad-hoc text convention: a short
+  RS-protected 5-byte header (`dest_id`, `src_id`, 3-byte target message
+  id), distinguished from an ordinary data frame right after the preamble
+  via `codes::FEC_SCHEME_ID_HI` (reserved for exactly this: "a future
+  third frame format"). No payload, no dictionary/charset decode needed —
+  much shorter and cheaper to recognize than a real message. Verified
+  round-trip (including scanning past a preceding data frame to find a
+  later NACK, and rejecting a malformed target id cleanly) against the
+  compiled `.wasm` binary.
 
 ## What's next
 
 Per the project brief (see `NEXT_AGENT_WEB_PROMPT.md`), still pending
 before the real UI gets built:
 
-1. **Resend-request protocol design** — a receiver needs to be able to ask
-   a sender to resend a specific message *over the audio channel itself*
-   (no server, no back-channel). Uses the wire format's already-reserved
-   but currently-unused `NACK` code. Needs a proposal + sign-off before
-   implementation.
-2. **Visual design** — strictly black-and-white, Special Elite typeface,
+1. **Visual design** — strictly black-and-white, Special Elite typeface,
    "looks crude but is actually carefully designed" telegraph/teletype
    aesthetic. 2-3 direction sketches to be reviewed before the real build.
-3. Live mic/speaker I/O via `AudioWorkletNode` (currently only
+2. Live mic/speaker I/O via `AudioWorkletNode` (currently only
    offline/file-based encode-decode is validated).
-4. The real UI: send/listen, message history with resend, the bell sound
+3. The real UI: send/listen, message history with resend, the bell sound
    on transfer complete (`bell_sound.wav`, CC0/public domain), real-time
-   streaming decode display.
-5. GitHub Pages deployment via Actions
+   streaming decode display, and the send-side wiring for the NACK
+   primitive above (per-frame message-id tagging on send, local resend
+   history, auto-retransmit on hearing a known id) — deliberately left for
+   the real UI/app-state work rather than bolted on ahead of the visual
+   design.
+4. GitHub Pages deployment via Actions
    (`actions/upload-pages-artifact` + `actions/deploy-pages`). Note: this
    repo is served at `https://seky443.github.io/TOVChat.github.io/` (a
    subpath, not the domain root) since the GitHub account is `SEKY443`,
