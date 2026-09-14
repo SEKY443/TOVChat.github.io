@@ -255,6 +255,23 @@ typewriter-key-styled controls.
     STOP. In-memory only — a page reload doesn't resume a retry cycle
     from before it, same tradeoff as the rest of this app's live-session
     state.
+
+    **Found live, running an actual back-and-forth conversation between
+    two tabs**: replying quickly to a message that had just arrived
+    reliably left the *original* message UNDELIVERED and the reply itself
+    never arrived either. Cause: `sendAckFor` (fired, not awaited, from
+    `handleDecodedFrame`) and the reply's own `sendMessage` both call
+    `playPcm` independently: with nothing serializing them, their two
+    `AudioBufferSourceNode`s played concurrently on the same
+    `AudioContext`, mixing both signals together acoustically and
+    corrupting both — the ack never decoded on the sender's end (a
+    correct, if confusing, `UNDELIVERED`, since it genuinely never heard
+    one), and the reply never decoded on the receiver's end either. Fixed
+    by giving `playPcm` a queue: every call chains onto the previous one
+    and only starts once it finishes, so "one clip plays at a time" holds
+    regardless of how many places call it or whether the caller awaits
+    the result. Verified by replaying the same conversation after the
+    fix — rapid back-to-back replies now both deliver cleanly.
 - **Calibrate** (the machine bar's "▸ CALIBRATE" link) — mirrors the CLI's
   `calibrate-send`/`calibrate-listen`: find which `(mode, parity_bytes)`
   setting(s) actually survive this specific real channel, instead of

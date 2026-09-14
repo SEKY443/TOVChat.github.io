@@ -561,21 +561,42 @@ const LEAD_IN_SILENCE_S = 0.3;
 // still ringing after the source node's `onended` fires.
 const CAPTURE_SUPPRESS_TAIL_S = 0.4;
 
+// Serializes every outgoing playback through one queue -- found live
+// (a two-tab weather conversation): an incoming message's automatic ack
+// (sendAckFor, fired from handleDecodedFrame without being awaited) and a
+// reply typed and sent moments later both call playPcm independently, and
+// with nothing to stop them, their two AudioBufferSourceNodes played
+// concurrently on the same AudioContext -- both signals mixed together
+// acoustically, garbling the ack (the sender's retry timer then genuinely
+// never heard it, correctly marking the original message UNDELIVERED)
+// *and* the reply (never decoded on the other end either). Chaining every
+// call onto this promise, instead of starting playback immediately, makes
+// "one clip plays at a time" true regardless of how many places call
+// playPcm or whether the caller awaits the result.
+let playbackQueue = Promise.resolve();
+
 function playPcm(float32Samples, sampleRate) {
-  return ensureAudioContext().then((ctx) => {
-    return new Promise((resolve) => {
-      const leadIn = Math.round(LEAD_IN_SILENCE_S * sampleRate);
-      const buffer = ctx.createBuffer(1, leadIn + float32Samples.length, sampleRate);
-      buffer.copyToChannel(float32Samples, 0, leadIn);
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(ctx.destination);
-      const durationMs = (buffer.length / sampleRate) * 1000;
-      suppressCaptureUntil = performance.now() + durationMs + CAPTURE_SUPPRESS_TAIL_S * 1000;
-      src.onended = resolve;
-      src.start();
-    });
-  });
+  const task = playbackQueue.then(() =>
+    ensureAudioContext().then((ctx) => {
+      return new Promise((resolve) => {
+        const leadIn = Math.round(LEAD_IN_SILENCE_S * sampleRate);
+        const buffer = ctx.createBuffer(1, leadIn + float32Samples.length, sampleRate);
+        buffer.copyToChannel(float32Samples, 0, leadIn);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const durationMs = (buffer.length / sampleRate) * 1000;
+        suppressCaptureUntil = performance.now() + durationMs + CAPTURE_SUPPRESS_TAIL_S * 1000;
+        src.onended = resolve;
+        src.start();
+      });
+    })
+  );
+  // Keep the queue moving even if this clip's caller never awaits it (e.g.
+  // sendAckFor's fire-and-forget) or playback fails -- one bad clip
+  // shouldn't wedge every later send behind it forever.
+  playbackQueue = task.catch(() => {});
+  return task;
 }
 
 // ============================= send =============================
