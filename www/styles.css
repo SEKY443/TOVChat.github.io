@@ -1,0 +1,284 @@
+@import url('https://fonts.googleapis.com/css2?family=Special+Elite&display=swap');
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #191919;
+  font-family: 'Special Elite', 'Courier New', monospace;
+  color: #191919;
+}
+
+button, input, textarea {
+  font-family: inherit;
+  border-radius: 0;
+}
+
+/* ============================= gate ============================= */
+
+.gate {
+  position: fixed;
+  inset: 0;
+  background: #191919;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.gate-box {
+  width: 100%;
+  max-width: 420px;
+  background: #f7f5ee;
+  border: 3px solid #f7f5ee;
+  padding: 34px 30px;
+  text-align: center;
+}
+
+.gate-title {
+  font-size: 22px;
+  letter-spacing: 8px;
+  color: #191919;
+}
+
+.gate-sub {
+  margin-top: 10px;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: #4a4a4a;
+  border-top: 2px double #191919;
+  border-bottom: 2px double #191919;
+  padding: 8px 0;
+}
+
+.gate-field { margin-top: 26px; text-align: left; }
+
+.label {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: #3a3a3a;
+  margin-bottom: 8px;
+}
+
+.paper-slot-input {
+  width: 100%;
+  border: none;
+  border-bottom: 2px solid #191919;
+  background: transparent;
+  color: #191919;
+  font-family: inherit;
+  font-size: 18px;
+  padding: 4px 2px 8px;
+  outline: none;
+}
+
+.gate-error {
+  margin-top: 12px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #191919;
+  background: #191919;
+  color: #f7f5ee;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.gate-box .key.spacebar {
+  width: 100%;
+  margin-top: 24px;
+  border: 3px double #191919;
+  background: transparent;
+  color: #191919;
+}
+.gate-box .key.spacebar:hover { background: #191919; color: #f7f5ee; }
+
+/* ============================= layout ============================= */
+
+.screen {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.paper {
+  background: #f7f5ee;
+  color: #191919;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 22px 0;
+}
+
+.masthead { flex-shrink: 0; text-align: center; padding-bottom: 4px; }
+.masthead-row { display: flex; align-items: baseline; justify-content: center; position: relative; }
+.masthead-title { font-size: 20px; letter-spacing: 8px; }
+.whoami {
+  position: absolute;
+  right: 0;
+  bottom: 2px;
+  border: 1px solid #191919;
+  background: transparent;
+  color: #191919;
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.whoami:hover { background: #191919; color: #f7f5ee; }
+.masthead-rule { border: none; border-top: 3px double #191919; margin: 8px 0 5px; }
+.masthead-sub { font-size: 9px; letter-spacing: 2.5px; color: #4a4a4a; padding-bottom: 12px; }
+
+.history {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 20px;
+}
+
+.history:empty::before {
+  content: "NO MESSAGES YET \2014 TYPE BELOW TO SEND, OR PRESS LISTEN TO RECEIVE";
+  display: block;
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: #8a8580;
+  margin-top: 30px;
+}
+
+/* ---- message slips ---- */
+
+.slip { border: 3px solid #191919; border-top-style: dashed; background: #f7f5ee; flex-shrink: 0; }
+
+.slip-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  background: #191919;
+  color: #f7f5ee;
+  padding: 6px 14px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+}
+.slip-text { padding: 14px 18px; font-size: 15px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.slip-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid #191919;
+  padding: 6px 14px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: #3a3a3a;
+}
+
+.slip.incomplete .slip-head { background: #f7f5ee; color: #191919; border-bottom: 3px solid #191919; }
+.slip.incomplete .slip-text { color: #4a4a4a; }
+
+.resend-tab {
+  border: 2px solid #191919;
+  background: #f7f5ee;
+  color: #191919;
+  font-family: inherit;
+  padding: 5px 12px 4px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  cursor: pointer;
+}
+.resend-tab:hover { background: #191919; color: #f7f5ee; }
+.resend-tab:disabled { opacity: 0.5; cursor: default; }
+
+/* ============================= machine (bottom bar) ============================= */
+
+.machine {
+  background: #191919;
+  color: #f7f5ee;
+  flex-shrink: 0;
+  padding: 14px 22px 18px;
+  border-top: 2px solid #f7f5ee;
+}
+
+.carriage-label {
+  font-size: 9px;
+  letter-spacing: 3px;
+  color: #b9b4a8;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.paper-slot {
+  display: block;
+  width: 100%;
+  border: none;
+  border-bottom: 2px solid #f7f5ee;
+  background: transparent;
+  color: #f7f5ee;
+  font-family: inherit;
+  font-size: 16px;
+  padding: 4px 4px 8px;
+  margin-bottom: 14px;
+  resize: none;
+  outline: none;
+  max-height: 120px;
+}
+.paper-slot::placeholder { color: #8f8a7e; }
+
+.keys-row { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; }
+
+.key {
+  border: 2px solid #f7f5ee;
+  background: transparent;
+  color: #f7f5ee;
+  font-family: inherit;
+  text-align: center;
+  padding: 10px 6px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  flex: 1;
+  min-width: 74px;
+  cursor: pointer;
+}
+.key:hover { background: rgba(247, 245, 238, 0.15); }
+.key.active { background: #f7f5ee; color: #191919; }
+.key.active:hover { background: #f7f5ee; }
+.key.listening { background: #f7f5ee; color: #191919; animation: blink 1.4s steps(2, jump-none) infinite; }
+
+@keyframes blink {
+  50% { background: transparent; color: #f7f5ee; }
+}
+
+.key.spacebar { flex: 2.2; font-size: 12px; letter-spacing: 3px; border-width: 3px; }
+.key:disabled { opacity: 0.4; cursor: default; }
+
+.second-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-top: 12px;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.file-decode-link {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: #b9b4a8;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.file-decode-link:hover { color: #f7f5ee; }
+
+.footnote { font-size: 9px; letter-spacing: 1.5px; color: #7a756c; }
+
+@media (max-width: 560px) {
+  .masthead-title { font-size: 16px; letter-spacing: 5px; }
+  .key { min-width: 60px; font-size: 9px; }
+}

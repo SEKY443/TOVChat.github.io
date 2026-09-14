@@ -2,136 +2,66 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>TOVChat wasm test harness (not the real UI)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TOVChat</title>
+<link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-<h1>Phase 1 test harness</h1>
-<p>Plain functional test page only &mdash; not the real design. Validates the
-wasm build + encode/decode round trip in a real browser.</p>
 
-<h2>Encode</h2>
-<textarea id="text" rows="3" cols="60">Hello from the browser</textarea><br />
-<label>Mode: <select id="mode">
-  <option value="phone">phone</option>
-  <option value="fast_air">fast_air</option>
-</select></label>
-<button id="encodeBtn">Encode</button>
-<button id="playBtn" disabled>Play</button>
-<button id="downloadBtn" disabled>Download WAV</button>
-<pre id="encodeLog"></pre>
+<!-- Username gate: shown until a username is set in localStorage. -->
+<div id="gate" class="gate" hidden>
+  <div class="gate-box">
+    <div class="gate-title">T O V C H A T</div>
+    <div class="gate-sub">A TELEGRAM &mdash; SENT BY VOICE &mdash; NO WIRE, NO SERVER</div>
+    <div class="gate-field">
+      <span class="label">CHOOSE A NAME (1&ndash;16 CHARACTERS)</span>
+      <input id="gate-input" class="paper-slot-input" type="text" maxlength="16" autocomplete="off" />
+    </div>
+    <div id="gate-error" class="gate-error" hidden></div>
+    <button id="gate-submit" class="key spacebar" type="button">BEGIN</button>
+  </div>
+</div>
 
-<h2>Decode</h2>
-<button id="decodeBtn" disabled>Decode last-encoded PCM</button>
-<br />
-<label>Or decode an uploaded WAV: <input type="file" id="fileInput" accept="audio/wav" /></label>
-<pre id="decodeLog"></pre>
+<!-- Main app -->
+<div id="app" class="screen" hidden>
 
-<script type="module">
-import init, { encode_to_pcm, decode_from_pcm } from "./pkg/tovchat_wasm.js";
+  <div class="paper">
+    <div class="masthead">
+      <div class="masthead-row">
+        <div class="masthead-title">T O V C H A T</div>
+        <button id="whoami" class="whoami" type="button" title="Change username"></button>
+      </div>
+      <hr class="masthead-rule" />
+      <div class="masthead-sub">A TELEGRAM &mdash; SENT BY VOICE &mdash; NO WIRE, NO SERVER</div>
+    </div>
 
-let lastPcm = null;
-const SR = 8000; // modem::SR
+    <div id="history" class="history" aria-live="polite"></div>
+  </div>
 
-function log(el, msg) {
-  document.getElementById(el).textContent += msg + "\n";
-}
+  <div class="machine">
+    <div class="carriage-label">
+      <span id="carriage-status">&#9642; TYPE YOUR MESSAGE &#9642;</span>
+    </div>
+    <textarea id="text-input" class="paper-slot" rows="1" maxlength="4000" placeholder="Type a message&hellip;"></textarea>
+    <div class="keys-row">
+      <button class="key mode-key active" data-mode="phone" type="button">PHONE</button>
+      <button class="key mode-key" data-mode="fast_air" type="button">FAST AIR</button>
+      <button id="listen-key" class="key" type="button">LISTEN</button>
+      <button id="send-key" class="key spacebar" type="button">TRANSMIT</button>
+    </div>
+    <div class="second-row">
+      <label class="file-decode-link">
+        &#9656; DECODE FROM FILE
+        <input id="file-input" type="file" accept="audio/*" hidden />
+      </label>
+      <span id="footnote" class="footnote">PROTECTED HEADER &middot; SESSION UNENCRYPTED</span>
+    </div>
+  </div>
 
-function pcmToWavBlob(samples, sampleRate) {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-  const writeStr = (offset, str) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, samples.length * 2, true);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(44 + i * 2, s * 32767, true);
-  }
-  return new Blob([buffer], { type: "audio/wav" });
-}
+</div>
 
-async function main() {
-  await init();
+<audio id="bell" src="./bell_sound.wav" preload="auto"></audio>
 
-  document.getElementById("encodeBtn").onclick = () => {
-    const text = document.getElementById("text").value;
-    const mode = document.getElementById("mode").value;
-    document.getElementById("encodeLog").textContent = "";
-    try {
-      const pcm = encode_to_pcm(text, mode, undefined, undefined, undefined, undefined, undefined);
-      lastPcm = pcm;
-      log("encodeLog", `ok: ${pcm.length} samples, ${(pcm.length / SR).toFixed(2)}s`);
-      document.getElementById("playBtn").disabled = false;
-      document.getElementById("downloadBtn").disabled = false;
-      document.getElementById("decodeBtn").disabled = false;
-    } catch (e) {
-      log("encodeLog", `ERROR: ${e}`);
-    }
-  };
-
-  document.getElementById("playBtn").onclick = async () => {
-    if (!lastPcm) return;
-    const ctx = new AudioContext({ sampleRate: SR });
-    const buf = ctx.createBuffer(1, lastPcm.length, SR);
-    buf.copyToChannel(lastPcm, 0);
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    src.start();
-  };
-
-  document.getElementById("downloadBtn").onclick = () => {
-    if (!lastPcm) return;
-    const blob = pcmToWavBlob(lastPcm, SR);
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "encoded.wav";
-    a.click();
-  };
-
-  document.getElementById("decodeBtn").onclick = () => {
-    if (!lastPcm) return;
-    const mode = document.getElementById("mode").value;
-    document.getElementById("decodeLog").textContent = "";
-    try {
-      const text = decode_from_pcm(lastPcm, SR, mode, undefined, undefined);
-      log("decodeLog", `ok: ${JSON.stringify(text)}`);
-    } catch (e) {
-      log("decodeLog", `ERROR: ${e}`);
-    }
-  };
-
-  document.getElementById("fileInput").onchange = async (ev) => {
-    const file = ev.target.files[0];
-    if (!file) return;
-    document.getElementById("decodeLog").textContent = "";
-    const ctx = new AudioContext();
-    const arrayBuf = await file.arrayBuffer();
-    const audioBuf = await ctx.decodeAudioData(arrayBuf);
-    const samples = audioBuf.getChannelData(0);
-    const mode = document.getElementById("mode").value;
-    try {
-      const text = decode_from_pcm(samples, audioBuf.sampleRate, mode, undefined, undefined);
-      log("decodeLog", `ok (uploaded file, ${audioBuf.sampleRate}Hz): ${JSON.stringify(text)}`);
-    } catch (e) {
-      log("decodeLog", `ERROR: ${e}`);
-    }
-  };
-}
-
-main();
-</script>
+<script type="module" src="./app.js"></script>
 </body>
 </html>

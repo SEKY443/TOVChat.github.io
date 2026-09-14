@@ -385,3 +385,232 @@ pub fn scan_for_nack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Op
 
     Ok(None)
 }
+
+/// Encodes `chunks` as a sequence of independently-addressed frames (one
+/// per chunk, `seq` = index, `more_frames` = not the last one) -- unlike
+/// [`encode_to_pcm`], which hands one whole string to
+/// `message::build_message` and lets IT decide the split (so a caller-added
+/// prefix, like a resend-target id, only lands on the first resulting
+/// frame). Letting the caller pre-chunk means the caller can tag every
+/// chunk identically before calling this (e.g. the same short id on every
+/// frame of one message) so a single successfully-decoded frame reveals
+/// which message it belongs to, even if earlier frames were lost -- see
+/// textovervoice-core's `NackFrame` doc comment, which specifically calls
+/// for this.
+///
+/// `chunks.len()` must be 1-256 (`seq` is a `u8`) and each chunk's encoded
+/// payload must fit the wire format's length field, same constraints
+/// [`encode_to_pcm`] enforces via `message::build_message` -- reported the
+/// same way, as a clean `Err`, not a panic.
+#[wasm_bindgen]
+pub fn encode_frames_to_pcm(
+    chunks: Vec<String>,
+    mode: &str,
+    dest_id: Option<u8>,
+    src_id: Option<u8>,
+    session_key: Option<Vec<u8>>,
+) -> Result<Vec<f32>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let session_key = parse_session_key(session_key)?;
+    let dest_id = dest_id.unwrap_or(BROADCAST_ID);
+    let src_id = src_id.unwrap_or(UNKNOWN_SRC_ID);
+
+    if chunks.is_empty() || chunks.len() > 256 {
+        return Err(JsValue::from_str(&format!(
+            "chunks.len() must be 1-256 (seq is a u8), got {}",
+            chunks.len()
+        )));
+    }
+
+    let mut frames = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let frame = protocol::build_frame(
+            chunk,
+            &protocol::BuildOptions {
+                parity_bytes: fec::DEFAULT_PARITY_BYTES,
+                use_dictionary: true,
+                dest_id,
+                src_id,
+                session_key: session_key.as_ref(),
+                seq: i as u8,
+                more_frames: i + 1 < chunks.len(),
+                frame_format: protocol::FrameFormat::default(),
+            },
+        )
+        .ok_or_else(|| {
+            JsValue::from_str(&format!(
+                "chunk {i}'s encoded payload exceeded the wire format's {}-byte limit -- use \
+                 shorter chunks",
+                protocol::MAX_PAYLOAD_BYTES
+            ))
+        })?;
+        frames.push(frame);
+    }
+
+    let inter_frame_silence = vec![0.0f64; (INTER_FRAME_SILENCE_S * modem::SR as f64) as usize];
+    let mut audio = Vec::new();
+    for frame_codes in &frames {
+        let symbols = modem::bytes_to_symbols(frame_codes);
+        audio.extend(modem::modulate_frame(
+            &symbols,
+            profile.symbol_duration_s,
+            profile.guard_s,
+            modem::SR,
+        ));
+        audio.extend(&inter_frame_silence);
+    }
+
+    Ok(audio.into_iter().map(|s| s as f32).collect())
+}
+
+/// One frame's parse result, as returned by [`scan_next_frame`] -- the
+/// single-frame-at-a-time counterpart to [`decode_from_pcm`]'s full
+/// multi-frame reassembly. Lets a caller do its OWN reassembly
+/// incrementally (tracking per-id progress, e.g. "2 of 3 frames") instead
+/// of only finding out once a whole message either completes or the audio
+/// runs out.
+#[wasm_bindgen]
+pub struct ScannedFrame {
+    ok: bool,
+    text: Option<String>,
+    reason: String,
+    src_id: Option<u8>,
+    seq: Option<u8>,
+    more_frames: Option<bool>,
+    next_start: usize,
+}
+
+#[wasm_bindgen]
+impl ScannedFrame {
+    #[wasm_bindgen(getter)]
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> Option<String> {
+        self.text.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn reason(&self) -> String {
+        self.reason.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn src_id(&self) -> Option<u8> {
+        self.src_id
+    }
+    #[wasm_bindgen(getter)]
+    pub fn seq(&self) -> Option<u8> {
+        self.seq
+    }
+    #[wasm_bindgen(getter)]
+    pub fn more_frames(&self) -> Option<bool> {
+        self.more_frames
+    }
+    /// Sample offset to pass as `start_sample` on the next call, to
+    /// continue scanning after this frame (whether or not it parsed ok --
+    /// a caller should always advance past a found preamble, never retry
+    /// the same one).
+    #[wasm_bindgen(getter)]
+    pub fn next_start(&self) -> usize {
+        self.next_start
+    }
+}
+
+/// Finds and parses the next single frame starting at `start_sample`,
+/// ignoring NACK frames (returns `None` for them -- `scan_for_nack` is the
+/// dedicated way to find those). Returns `None` once no further preamble
+/// can be found before the audio runs out, matching `decode_from_pcm`'s
+/// same "clean, honest absence" convention.
+///
+/// A caller polling live audio calls this in a loop from `start_sample =
+/// 0`, feeding each result's `next_start` back in, until it gets `None`
+/// for the current buffer -- then waits for more audio and resumes from
+/// the last `next_start` it saw.
+#[wasm_bindgen]
+pub fn scan_next_frame(
+    samples: &[f32],
+    sample_rate: u32,
+    mode: &str,
+    start_sample: usize,
+) -> Result<Option<ScannedFrame>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let sr = sample_rate;
+    let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
+
+    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
+    let preamble_len_n = (modem::PREAMBLE_DURATION_S * sr as f64) as usize;
+    if step_n == 0 || preamble_len_n == 0 {
+        return Err(JsValue::from_str(&format!(
+            "unusable sample rate ({sr}Hz) for the requested timing -- expected something close \
+             to {}Hz",
+            modem::SR
+        )));
+    }
+    if start_sample >= audio.len() {
+        return Ok(None);
+    }
+
+    let reference = modem::generate_preamble(
+        modem::PREAMBLE_DURATION_S,
+        modem::PREAMBLE_F0,
+        modem::PREAMBLE_F1,
+        sr,
+    );
+
+    let Some((abs_offset, _score)) = scan_for_preamble(&audio, start_sample, &reference, sr)
+    else {
+        return Ok(None);
+    };
+    let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
+    let available = audio.len().saturating_sub(payload_start);
+    let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
+
+    let detections = modem::demodulate(
+        &audio[payload_start..],
+        n_symbols,
+        profile.symbol_duration_s,
+        profile.guard_s,
+        sr,
+        0,
+    );
+    let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
+    let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
+    let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
+
+    let next_start = match protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
+    {
+        Some(consumed_codes) => {
+            let consumed_symbols = (consumed_codes * 8).div_ceil(6);
+            let exact_end = payload_start + consumed_symbols * step_n;
+            payload_start.max(exact_end.saturating_sub((PREAMBLE_BACKOFF_S * sr as f64) as usize))
+        }
+        None => abs_offset + preamble_len_n,
+    };
+
+    // A NACK frame here is legitimate audio, just not what this function
+    // reports on -- skip it and let the caller's loop continue from
+    // next_start, same as decode_from_pcm treats it as "not what I'm
+    // looking for" rather than an error.
+    if protocol::parse_nack_frame(&frame_codes).is_some() {
+        return Ok(Some(ScannedFrame {
+            ok: false,
+            text: None,
+            reason: "nack frame, not a data frame".to_string(),
+            src_id: None,
+            seq: None,
+            more_frames: None,
+            next_start,
+        }));
+    }
+
+    let result = protocol::parse_frame(&frame_codes, fec::DEFAULT_PARITY_BYTES, true, None, None);
+    Ok(Some(ScannedFrame {
+        ok: result.ok,
+        text: result.text,
+        reason: result.reason,
+        src_id: result.src_id,
+        seq: result.seq,
+        more_frames: result.more_frames,
+        next_start,
+    }))
+}
