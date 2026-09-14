@@ -21,6 +21,21 @@ const LISTEN_MODES = ["phone", "fast_air"];
 const POLL_INTERVAL_MS = 1200;
 const MAX_BUFFER_SECONDS = 40; // hard safety cap on the live capture ring buffer
 
+// Mirrors CLI-TextOverVoice's chat.rs all_candidates(): every (mode,
+// parity_bytes) combination its adaptive ladder can reach, most robust
+// first. calibrate-send transmits a known probe under each one in turn;
+// calibrate-listen tries decoding under all of them and reports which
+// setting(s) actually survived the real channel.
+const CALIBRATE_CANDIDATES = [
+  { mode: "phone", parity: 40 },
+  { mode: "phone", parity: 20 },
+  { mode: "phone", parity: 10 },
+  { mode: "fast_air", parity: 40 },
+  { mode: "fast_air", parity: 20 },
+  { mode: "fast_air", parity: 10 },
+];
+const CALIBRATE_PROBE_GAP_MS = 500; // matches calibrate.rs's inter-probe gap
+
 // ============================= fatal error display =============================
 
 // Any uncaught error here previously meant the page just silently did
@@ -168,6 +183,15 @@ const carriageStatus = document.getElementById("carriage-status");
 const bellEl = document.getElementById("bell");
 const modeKeys = Array.from(document.querySelectorAll(".mode-key"));
 
+const calibratePanel = document.getElementById("calibrate-panel");
+const calibrateOpenBtn = document.getElementById("calibrate-open");
+const calibrateCloseBtn = document.getElementById("calibrate-close");
+const calibrateCodeInput = document.getElementById("calibrate-code");
+const calibrateStatusEl = document.getElementById("calibrate-status");
+const calibrateSendBtn = document.getElementById("calibrate-send");
+const calibrateListenBtn = document.getElementById("calibrate-listen");
+const calibrateResultsEl = document.getElementById("calibrate-results");
+
 // ============================= state =============================
 
 let username = loadUsername();
@@ -183,6 +207,10 @@ let captureSampleRate = SR;
 let scanPos = { phone: 0, fast_air: 0 };
 let liveReassembler = new Reassembler();
 let pollTimer = null;
+
+let calibrating = false;
+let calibrateScanPos = new Map(); // "mode:parity" -> sample offset
+let calibrateMatches = new Set(); // "mode:parity" already reported
 
 // ============================= rendering =============================
 
@@ -508,15 +536,7 @@ async function handleNackFound(info) {
   if (entry) await resendOwnMessage(targetId);
 }
 
-async function pollCapture() {
-  if (captureChunks.length === 0) return;
-  const buffer = materializeCaptureBuffer();
-
-  if (buffer.length > MAX_BUFFER_SECONDS * captureSampleRate) {
-    resetCaptureBuffer();
-    return;
-  }
-
+async function pollCapture(buffer) {
   for (const mode of LISTEN_MODES) {
     let pos = scanPos[mode];
     while (true) {
@@ -551,22 +571,22 @@ async function pollCapture() {
   }
 }
 
-async function startListening() {
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
-  } catch (e) {
-    setCarriageStatus(`▢ MICROPHONE ACCESS DENIED ▢`);
-    return;
-  }
+/// Starts mic capture (getUserMedia + AudioWorkletNode) and a poll
+/// interval calling `onPoll` with the freshly materialized buffer every
+/// `POLL_INTERVAL_MS`. Shared by normal listening and calibrate-listening
+/// -- they differ only in what they DO with the captured audio, not in how
+/// it's captured. Throws (with the mic-access-denied message already set)
+/// if permission is refused; callers should not flip their own "active"
+/// UI state until this resolves.
+async function startCapture(onPoll) {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
 
   const ctx = await ensureAudioContext();
   await ctx.audioWorklet.addModule("./capture-worklet.js");
   captureSampleRate = ctx.sampleRate;
   captureChunks = [];
-  scanPos = { phone: 0, fast_air: 0 };
-  liveReassembler = new Reassembler();
 
   const source = ctx.createMediaStreamSource(mediaStream);
   workletNode = new AudioWorkletNode(ctx, "capture-processor");
@@ -575,18 +595,18 @@ async function startListening() {
   };
   source.connect(workletNode);
 
-  listening = true;
-  listenKey.classList.add("listening");
-  listenKey.textContent = "LISTENING";
-  setCarriageStatus("● LISTENING…");
-  pollTimer = setInterval(pollCapture, POLL_INTERVAL_MS);
+  pollTimer = setInterval(() => {
+    if (captureChunks.length === 0) return;
+    const buffer = materializeCaptureBuffer();
+    if (buffer.length > MAX_BUFFER_SECONDS * captureSampleRate) {
+      captureChunks = [];
+      return;
+    }
+    onPoll(buffer);
+  }, POLL_INTERVAL_MS);
 }
 
-function stopListening() {
-  listening = false;
-  listenKey.classList.remove("listening");
-  listenKey.textContent = "LISTEN";
-  setCarriageStatus("▢ TYPE YOUR MESSAGE ▢");
+function stopCapture() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = null;
   if (workletNode) workletNode.port.onmessage = null;
@@ -596,9 +616,165 @@ function stopListening() {
   captureChunks = [];
 }
 
+async function startListening() {
+  scanPos = { phone: 0, fast_air: 0 };
+  liveReassembler = new Reassembler();
+  try {
+    await startCapture(pollCapture);
+  } catch (e) {
+    setCarriageStatus(`▢ MICROPHONE ACCESS DENIED ▢`);
+    return;
+  }
+  listening = true;
+  listenKey.classList.add("listening");
+  listenKey.textContent = "LISTENING";
+  setCarriageStatus("● LISTENING…");
+}
+
+function stopListening() {
+  listening = false;
+  listenKey.classList.remove("listening");
+  listenKey.textContent = "LISTEN";
+  setCarriageStatus("▢ TYPE YOUR MESSAGE ▢");
+  stopCapture();
+}
+
 listenKey.addEventListener("click", () => {
+  if (calibrating) return; // one mic session at a time -- see the calibrate panel
   if (listening) stopListening();
   else startListening();
+});
+
+// ============================= calibrate =============================
+//
+// Mirrors CLI-TextOverVoice's calibrate-send/calibrate-listen: find which
+// (mode, parity_bytes) setting(s) actually survive this specific real
+// channel, instead of guessing one and hoping. calibrate-send transmits a
+// known code under every CALIBRATE_CANDIDATES entry in turn;
+// calibrate-listen tries decoding incoming audio under all of them and
+// reports which produced an exact match.
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function setCalibrateStatus(text) {
+  calibrateStatusEl.textContent = text;
+}
+
+function candidateKey(mode, parity) {
+  return `${mode}:${parity}`;
+}
+
+function renderCalibrateResults() {
+  calibrateResultsEl.innerHTML = "";
+  for (const { mode, parity } of CALIBRATE_CANDIDATES) {
+    const key = candidateKey(mode, parity);
+    const row = document.createElement("div");
+    row.className = "calibrate-result-row" + (calibrateMatches.has(key) ? " match" : "");
+    const label = document.createElement("span");
+    label.textContent = `${mode.toUpperCase()} / PARITY ${parity}`;
+    const verdict = document.createElement("span");
+    verdict.className = "r-verdict";
+    verdict.textContent = calibrateMatches.has(key) ? "MATCH" : "—";
+    row.append(label, verdict);
+    calibrateResultsEl.appendChild(row);
+  }
+}
+
+function openCalibrate() {
+  if (listening) stopListening(); // one mic session at a time
+  calibrateMatches = new Set();
+  renderCalibrateResults();
+  setCalibrateStatus("▢ IDLE ▢");
+  calibratePanel.hidden = false;
+}
+
+function closeCalibrate() {
+  if (calibrating) stopCalibrateListening();
+  calibratePanel.hidden = true;
+}
+
+async function sendCalibrateProbes() {
+  const code = calibrateCodeInput.value.trim();
+  if (!code) {
+    setCalibrateStatus("▢ ENTER A CALIBRATION CODE ▢");
+    return;
+  }
+  calibrateSendBtn.disabled = true;
+  calibrateListenBtn.disabled = true;
+  try {
+    for (let i = 0; i < CALIBRATE_CANDIDATES.length; i++) {
+      const { mode, parity } = CALIBRATE_CANDIDATES[i];
+      setCalibrateStatus(
+        `● [${i + 1}/${CALIBRATE_CANDIDATES.length}] SENDING ${mode.toUpperCase()} / PARITY ${parity}…`
+      );
+      const pcm = encode_frames_to_pcm([code], mode, undefined, undefined, undefined, parity);
+      await playPcm(pcm, SR);
+      if (i + 1 < CALIBRATE_CANDIDATES.length) await sleep(CALIBRATE_PROBE_GAP_MS);
+    }
+    setCalibrateStatus(`▢ SENT ALL ${CALIBRATE_CANDIDATES.length} PROBES ▢`);
+  } finally {
+    calibrateSendBtn.disabled = false;
+    calibrateListenBtn.disabled = false;
+  }
+}
+
+function pollCalibrateCapture(buffer) {
+  const code = calibrateCodeInput.value.trim();
+  for (const { mode, parity } of CALIBRATE_CANDIDATES) {
+    const key = candidateKey(mode, parity);
+    if (calibrateMatches.has(key)) continue; // already confirmed, no need to keep scanning for it
+    let pos = calibrateScanPos.get(key) || 0;
+    while (true) {
+      let frame;
+      try {
+        frame = scan_next_frame(buffer, captureSampleRate, mode, pos, parity);
+      } catch {
+        break;
+      }
+      if (!frame) break;
+      if (frame.ok && frame.text === code) {
+        calibrateMatches.add(key);
+        renderCalibrateResults();
+        setCalibrateStatus(`● MATCH: ${mode.toUpperCase()} / PARITY ${parity} ●`);
+      }
+      pos = frame.next_start;
+    }
+    calibrateScanPos.set(key, pos);
+  }
+}
+
+async function startCalibrateListening() {
+  calibrateScanPos = new Map();
+  try {
+    await startCapture(pollCalibrateCapture);
+  } catch (e) {
+    setCalibrateStatus("▢ MICROPHONE ACCESS DENIED ▢");
+    return;
+  }
+  calibrating = true;
+  calibrateListenBtn.classList.add("active");
+  calibrateListenBtn.textContent = "LISTENING…";
+  calibrateSendBtn.disabled = true;
+  setCalibrateStatus("● LISTENING FOR PROBES… ●");
+}
+
+function stopCalibrateListening() {
+  calibrating = false;
+  calibrateListenBtn.classList.remove("active");
+  calibrateListenBtn.textContent = "LISTEN FOR PROBES";
+  calibrateSendBtn.disabled = false;
+  setCalibrateStatus("▢ IDLE ▢");
+  stopCapture();
+}
+
+calibrateOpenBtn.addEventListener("click", openCalibrate);
+calibrateCloseBtn.addEventListener("click", closeCalibrate);
+calibrateSendBtn.addEventListener("click", sendCalibrateProbes);
+calibrateListenBtn.addEventListener("click", () => {
+  if (calibrating) stopCalibrateListening();
+  else startCalibrateListening();
 });
 
 // ============================= receive: file upload =============================

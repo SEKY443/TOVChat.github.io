@@ -50,6 +50,23 @@ typewriter-key-styled controls.
     hearing a NACK for a message id in this browser's own sent history
     triggers an automatic resend — no manual action needed on the
     sender's side, as long as it's listening.
+- **Calibrate** (the machine bar's "▸ CALIBRATE" link) — mirrors the CLI's
+  `calibrate-send`/`calibrate-listen`: find which `(mode, parity_bytes)`
+  setting(s) actually survive this specific real channel, instead of
+  guessing one and hoping. Required exposing `parity_bytes` as a real
+  parameter on `encode_to_pcm`/`encode_frames_to_pcm`/`decode_from_pcm`/
+  `scan_next_frame` (it had been hardcoded to the default everywhere) —
+  every one of the 6 candidates `chat.rs`'s adaptive ladder can reach
+  (`phone`/`fast_air` × parity 40/20/10, most robust first) is a real,
+  independently addressable setting now, not just a mode toggle. SEND
+  PROBES transmits a known code under all 6 in turn; LISTEN FOR PROBES
+  scans incoming audio under all 6 in parallel (each with its own scan
+  cursor) and reports which one(s) produced an exact match. Verified live
+  in a real browser: full probe-send sequence (progress through all 6,
+  correct status/disabled-state transitions), and confirmed the
+  discrimination property itself — a probe encoded under one setting does
+  not falsely match when scanned under a different one — via the
+  compiled `.wasm` binary directly.
 
 Verified live against the deployed site in a real browser (Chrome):
 username gate, send (real speaker playback, history rendering, bell),
@@ -72,15 +89,15 @@ on its own) — live capture wiring (`AudioWorkletNode`, the polling loop)
 is careful but unexercised beyond that.
 
 v1 deliberately does not include: addressing/contacts UI, encryption key
-exchange UX, `calibrate` mode. Broadcast + unencrypted only for now — the
-username envelope is the "who's this from" mechanism in the meantime.
+exchange UX. Broadcast + unencrypted only for now — the username envelope
+is the "who's this from" mechanism in the meantime.
 
 ## What's next
 
 1. **Validate a real microphone/speaker acoustic round trip** — grant mic
    access when prompted and try sending between two tabs/devices.
-2. Addressing/contacts UI, encryption key exchange UX, `calibrate` mode —
-   each needs its own UX design before it's worth building.
+2. Addressing/contacts UI, encryption key exchange UX — each needs its
+   own UX design before it's worth building.
 
 GitHub Pages is live at `https://seky443.github.io/TOVChat.github.io/`
 (Settings → Pages → "Build and deployment source: GitHub Actions" is

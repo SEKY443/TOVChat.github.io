@@ -69,6 +69,7 @@ pub fn encode_to_pcm(
     session_key: Option<Vec<u8>>,
     max_frame_chars: Option<usize>,
     repeat: Option<u32>,
+    parity_bytes: Option<usize>,
 ) -> Result<Vec<f32>, JsValue> {
     let profile = resolve_mode(mode)?;
     let session_key = parse_session_key(session_key)?;
@@ -76,6 +77,7 @@ pub fn encode_to_pcm(
     let src_id = src_id.unwrap_or(UNKNOWN_SRC_ID);
     let max_frame_chars = max_frame_chars.unwrap_or(message::MAX_FRAME_CHARS);
     let repeat = repeat.unwrap_or(1);
+    let parity_bytes = parity_bytes.unwrap_or(fec::DEFAULT_PARITY_BYTES);
 
     if repeat == 0 {
         return Err(JsValue::from_str("repeat must be at least 1, got 0"));
@@ -93,7 +95,7 @@ pub fn encode_to_pcm(
     let frames = message::build_message(
         text,
         &message::MessageBuildOptions {
-            parity_bytes: fec::DEFAULT_PARITY_BYTES,
+            parity_bytes,
             use_dictionary: true,
             dest_id,
             src_id,
@@ -166,6 +168,7 @@ fn scan_for_preamble(audio: &[f64], start: usize, reference: &[f64], sr: u32) ->
 /// Hz back into text. `my_id`, when given, filters to frames addressed to
 /// that id (broadcast frames still match). `session_key` must match
 /// whatever key the sender encrypted with, if any.
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn decode_from_pcm(
     samples: &[f32],
@@ -173,10 +176,12 @@ pub fn decode_from_pcm(
     mode: &str,
     my_id: Option<u8>,
     session_key: Option<Vec<u8>>,
+    parity_bytes: Option<usize>,
 ) -> Result<String, JsValue> {
     let profile = resolve_mode(mode)?;
     let session_key = parse_session_key(session_key)?;
     let sr = sample_rate;
+    let parity_bytes = parity_bytes.unwrap_or(fec::DEFAULT_PARITY_BYTES);
 
     let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
 
@@ -222,7 +227,7 @@ pub fn decode_from_pcm(
 
         let result = protocol::parse_frame(
             &frame_codes,
-            fec::DEFAULT_PARITY_BYTES,
+            parity_bytes,
             true,
             my_id,
             session_key.as_ref(),
@@ -233,9 +238,7 @@ pub fn decode_from_pcm(
             return Ok(msg_result.text.unwrap_or_default());
         }
 
-        if let Some(consumed_codes) =
-            protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
-        {
+        if let Some(consumed_codes) = protocol::frame_wire_length(&frame_codes, 0, parity_bytes) {
             let consumed_symbols = (consumed_codes * 8).div_ceil(6);
             let exact_end = payload_start + consumed_symbols * step_n;
             search_start =
@@ -402,6 +405,7 @@ pub fn scan_for_nack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Op
 /// payload must fit the wire format's length field, same constraints
 /// [`encode_to_pcm`] enforces via `message::build_message` -- reported the
 /// same way, as a clean `Err`, not a panic.
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn encode_frames_to_pcm(
     chunks: Vec<String>,
@@ -409,11 +413,13 @@ pub fn encode_frames_to_pcm(
     dest_id: Option<u8>,
     src_id: Option<u8>,
     session_key: Option<Vec<u8>>,
+    parity_bytes: Option<usize>,
 ) -> Result<Vec<f32>, JsValue> {
     let profile = resolve_mode(mode)?;
     let session_key = parse_session_key(session_key)?;
     let dest_id = dest_id.unwrap_or(BROADCAST_ID);
     let src_id = src_id.unwrap_or(UNKNOWN_SRC_ID);
+    let parity_bytes = parity_bytes.unwrap_or(fec::DEFAULT_PARITY_BYTES);
 
     if chunks.is_empty() || chunks.len() > 256 {
         return Err(JsValue::from_str(&format!(
@@ -427,7 +433,7 @@ pub fn encode_frames_to_pcm(
         let frame = protocol::build_frame(
             chunk,
             &protocol::BuildOptions {
-                parity_bytes: fec::DEFAULT_PARITY_BYTES,
+                parity_bytes,
                 use_dictionary: true,
                 dest_id,
                 src_id,
@@ -526,15 +532,18 @@ impl ScannedFrame {
 /// 0`, feeding each result's `next_start` back in, until it gets `None`
 /// for the current buffer -- then waits for more audio and resumes from
 /// the last `next_start` it saw.
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn scan_next_frame(
     samples: &[f32],
     sample_rate: u32,
     mode: &str,
     start_sample: usize,
+    parity_bytes: Option<usize>,
 ) -> Result<Option<ScannedFrame>, JsValue> {
     let profile = resolve_mode(mode)?;
     let sr = sample_rate;
+    let parity_bytes = parity_bytes.unwrap_or(fec::DEFAULT_PARITY_BYTES);
     let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
 
     let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
@@ -577,8 +586,7 @@ pub fn scan_next_frame(
     let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
     let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
 
-    let next_start = match protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
-    {
+    let next_start = match protocol::frame_wire_length(&frame_codes, 0, parity_bytes) {
         Some(consumed_codes) => {
             let consumed_symbols = (consumed_codes * 8).div_ceil(6);
             let exact_end = payload_start + consumed_symbols * step_n;
@@ -603,7 +611,7 @@ pub fn scan_next_frame(
         }));
     }
 
-    let result = protocol::parse_frame(&frame_codes, fec::DEFAULT_PARITY_BYTES, true, None, None);
+    let result = protocol::parse_frame(&frame_codes, parity_bytes, true, None, None);
     Ok(Some(ScannedFrame {
         ok: result.ok,
         text: result.text,

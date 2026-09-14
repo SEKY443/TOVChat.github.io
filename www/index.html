@@ -50,14 +50,43 @@
       <button id="send-key" class="key spacebar" type="button">TRANSMIT</button>
     </div>
     <div class="second-row">
-      <label class="file-decode-link">
-        &#9656; DECODE FROM FILE
-        <input id="file-input" type="file" accept="audio/*" hidden />
-      </label>
+      <span class="second-row-links">
+        <label class="file-decode-link">
+          &#9656; DECODE FROM FILE
+          <input id="file-input" type="file" accept="audio/*" hidden />
+        </label>
+        <button id="calibrate-open" class="file-decode-link link-btn" type="button">&#9656; CALIBRATE</button>
+      </span>
       <span id="footnote" class="footnote">PROTECTED HEADER &middot; SESSION UNENCRYPTED</span>
     </div>
   </div>
 
+</div>
+
+<!-- Calibration panel: finds which (mode, parity) setting(s) survive the
+     real channel between two ends, mirroring the CLI's calibrate-send/
+     calibrate-listen. Hidden until opened from the machine bar. -->
+<div id="calibrate-panel" class="gate" hidden>
+  <div class="gate-box calibrate-box">
+    <div class="gate-title calibrate-title">CALIBRATION</div>
+    <div class="gate-sub">FIND WHICH SETTING SURVIVES THIS CHANNEL</div>
+
+    <div class="gate-field">
+      <span class="label">CALIBRATION CODE</span>
+      <input id="calibrate-code" class="paper-slot-input" type="text" value="CALIBRATE-OK" autocomplete="off" />
+    </div>
+
+    <div class="calibrate-status" id="calibrate-status">&#9642; IDLE &#9642;</div>
+
+    <div class="calibrate-actions">
+      <button id="calibrate-send" class="key" type="button">SEND PROBES</button>
+      <button id="calibrate-listen" class="key" type="button">LISTEN FOR PROBES</button>
+    </div>
+
+    <div class="calibrate-results" id="calibrate-results"></div>
+
+    <button id="calibrate-close" class="key spacebar calibrate-close" type="button">CLOSE</button>
+  </div>
 </div>
 
 <audio id="bell" src="./bell_sound.wav" preload="auto"></audio>

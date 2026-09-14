@@ -291,6 +291,8 @@ button, input, textarea {
   gap: 6px;
 }
 
+.second-row-links { display: flex; gap: 18px; }
+
 .file-decode-link {
   font-size: 9px;
   letter-spacing: 1.5px;
@@ -300,7 +302,65 @@ button, input, textarea {
 }
 .file-decode-link:hover { color: #f7f5ee; }
 
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+}
+
 .footnote { font-size: 9px; letter-spacing: 1.5px; color: #7a756c; }
+
+/* ============================= calibration panel ============================= */
+
+.calibrate-box { max-width: 460px; }
+.calibrate-title { font-size: 18px; letter-spacing: 5px; }
+
+.calibrate-status {
+  margin-top: 20px;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #3a3a3a;
+  text-align: center;
+}
+
+.calibrate-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+.calibrate-actions .key {
+  border: 2px solid #191919;
+  background: transparent;
+  color: #191919;
+}
+.calibrate-actions .key:hover { background: rgba(25, 25, 25, 0.08); }
+.calibrate-actions .key.active {
+  background: #191919;
+  color: #f7f5ee;
+  animation: blink 1.4s steps(2, jump-none) infinite;
+}
+.calibrate-actions .key:disabled { opacity: 0.4; cursor: default; }
+
+.calibrate-results {
+  margin-top: 16px;
+  max-height: 160px;
+  overflow-y: auto;
+  text-align: left;
+}
+.calibrate-result-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 6px 0;
+  border-bottom: 1px dotted #191919;
+}
+.calibrate-result-row:last-child { border-bottom: none; }
+.calibrate-result-row.match { font-weight: bold; }
+.calibrate-result-row .r-verdict { text-decoration: underline; }
+
+.calibrate-close { width: 100%; margin-top: 18px; }
 
 @media (max-width: 560px) {
   .masthead-title { font-size: 16px; letter-spacing: 5px; }
