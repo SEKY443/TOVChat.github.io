@@ -3,15 +3,25 @@ import init, {
   scan_next_frame,
   build_nack_pcm,
   scan_for_nack,
+  build_ack_pcm,
+  scan_for_ack,
 } from "./pkg/tovchat_wasm.js";
 
 const SR = 8000; // modem::SR -- outgoing PCM is always synthesized at this rate
 
 const STORAGE_USERNAME = "tovchat_username";
 const STORAGE_HISTORY = "tovchat_history";
+const STORAGE_MAX_RETRIES = "tovchat_max_retries";
 const MAX_USERNAME_CHARS = 16;
 const CHUNK_TEXT_CHARS = 700; // real-text budget per frame, leaving headroom for the envelope
 const MAX_HISTORY_ENTRIES = 300;
+const DEFAULT_MAX_RETRIES = 3;
+// Grace period after a message finishes playing before treating a missing
+// ack as "resend": long enough for the other side to finish decoding, build
+// an ack frame (short, but not instant), and for that ack's own preamble +
+// header to arrive back -- not scaled to message length since that's
+// already accounted for by scheduling this timer only after playback ends.
+const RETRY_ACK_GRACE_MS = 6000;
 
 const MSG_START = "\x02";
 const USERNAME_SEP = "\x1F";
@@ -162,6 +172,23 @@ function saveHistory(history) {
   }
 }
 
+function loadMaxRetries() {
+  try {
+    const raw = parseInt(localStorage.getItem(STORAGE_MAX_RETRIES), 10);
+    return Number.isFinite(raw) && raw >= 0 && raw <= 20 ? raw : DEFAULT_MAX_RETRIES;
+  } catch {
+    return DEFAULT_MAX_RETRIES;
+  }
+}
+
+function saveMaxRetries(n) {
+  try {
+    localStorage.setItem(STORAGE_MAX_RETRIES, String(n));
+  } catch {
+    // non-critical -- worst case the setting just doesn't persist across reloads
+  }
+}
+
 // ============================= envelope =============================
 
 function randomMsgId() {
@@ -250,6 +277,7 @@ const fileInput = document.getElementById("file-input");
 const carriageStatus = document.getElementById("carriage-status");
 const bellEl = document.getElementById("bell");
 const modeKeys = Array.from(document.querySelectorAll(".mode-key"));
+const retryCountInput = document.getElementById("retry-count");
 
 const calibratePanel = document.getElementById("calibrate-panel");
 const calibrateOpenBtn = document.getElementById("calibrate-open");
@@ -296,6 +324,14 @@ let calibrating = false;
 let calibrateScanPos = new Map(); // "mode:parity" -> sample offset
 let calibrateStuckSince = new Map(); // "mode:parity" -> Date.now() a truncation-looking retry started
 let calibrateMatches = new Set(); // "mode:parity" already reported
+
+let maxRetries = loadMaxRetries();
+// id -> { chunks, mode, attempt, timer } -- an outgoing message still
+// waiting for an ack, with a pending setTimeout to resend it if one
+// doesn't arrive. In-memory only: a page reload doesn't resume retrying a
+// message from before the reload (its status just stays whatever it last
+// was), same tradeoff every other piece of live-session state here makes.
+const pendingDeliveries = new Map();
 
 let suppressCaptureUntil = 0; // performance.now() timestamp -- see playPcm
 
@@ -360,12 +396,22 @@ function renderEntry(entry) {
     foot.className = "slip-foot";
     const spacer = document.createElement("span");
     spacer.textContent = new Date(entry.time).toLocaleTimeString();
-    const resend = document.createElement("button");
-    resend.className = "resend-tab";
-    resend.textContent = "RESEND ▶";
-    resend.type = "button";
-    resend.addEventListener("click", () => resendOwnMessage(entry.id));
-    foot.append(spacer, resend);
+    foot.append(spacer);
+    if (pendingDeliveries.has(entry.id)) {
+      const stop = document.createElement("button");
+      stop.className = "resend-tab";
+      stop.textContent = "STOP ▶";
+      stop.type = "button";
+      stop.addEventListener("click", () => stopDeliveryRetry(entry.id));
+      foot.append(stop);
+    } else {
+      const resend = document.createElement("button");
+      resend.className = "resend-tab";
+      resend.textContent = "RESEND ▶";
+      resend.type = "button";
+      resend.addEventListener("click", () => resendOwnMessage(entry.id));
+      foot.append(resend);
+    }
     slip.append(foot);
   } else {
     // Received messages get the same one-click resend the brief asks for
@@ -416,7 +462,20 @@ async function animateEntryReveal(el, fullText, startAt, key) {
 }
 
 function statusLabel(entry) {
-  if (entry.dir === "tx") return "SENT";
+  if (entry.dir === "tx") {
+    switch (entry.status) {
+      case "awaiting-ack":
+        return "AWAITING ACK";
+      case "resending":
+        return `RESENDING (${entry.attempt}/${maxRetries})`;
+      case "delivered":
+        return "✓ DELIVERED";
+      case "undelivered":
+        return "✕ UNDELIVERED";
+      default:
+        return "SENT";
+    }
+  }
   return entry.status === "incomplete" ? "INCOMPLETE" : "RECEIVED";
 }
 
@@ -580,6 +639,84 @@ async function sendMessage() {
     sendKey.disabled = false;
     setCarriageStatus(listening ? "● LISTENING…" : "▢ TYPE YOUR MESSAGE ▢");
   }
+
+  if (maxRetries > 0) {
+    pendingDeliveries.set(id, { chunks: taggedChunks, mode: selectedMode, attempt: 0, timer: null });
+    updateHistoryEntry(id, "tx", { status: "awaiting-ack" });
+    scheduleDeliveryRetry(id);
+  }
+}
+
+/// Schedules the next auto-resend check for `id` -- called once right
+/// after the initial send, then again after every retry attempt. Does
+/// nothing if `id` isn't (or is no longer) pending, so a stray call after
+/// an ack already arrived or the cycle was stopped is harmless.
+function scheduleDeliveryRetry(id) {
+  const pending = pendingDeliveries.get(id);
+  if (!pending) return;
+  pending.timer = setTimeout(() => attemptDeliveryRetry(id), RETRY_ACK_GRACE_MS);
+}
+
+async function attemptDeliveryRetry(id) {
+  const pending = pendingDeliveries.get(id);
+  if (!pending) return; // acked or stopped since this timer was scheduled
+
+  if (pending.attempt >= maxRetries) {
+    pendingDeliveries.delete(id);
+    updateHistoryEntry(id, "tx", { status: "undelivered" });
+    return;
+  }
+
+  pending.attempt += 1;
+  updateHistoryEntry(id, "tx", { status: "resending", attempt: pending.attempt });
+  try {
+    const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined);
+    await playPcm(pcm, SR);
+  } catch {
+    // A transient encode/playback failure shouldn't silently end the retry
+    // cycle -- fall through and schedule the next attempt anyway.
+  }
+  // Re-check: markDelivered/stopDeliveryRetry could have fired while the
+  // resend above was playing.
+  if (pendingDeliveries.has(id)) scheduleDeliveryRetry(id);
+}
+
+/// Called when an ack for `id` is heard -- cancels any pending retry and
+/// marks the message delivered. A no-op if `id` isn't a message this
+/// device is currently tracking (an ack for someone else's message, or one
+/// already resolved).
+function markDelivered(id) {
+  const pending = pendingDeliveries.get(id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingDeliveries.delete(id);
+  updateHistoryEntry(id, "tx", { status: "delivered" });
+}
+
+/// User-initiated cancel of an in-progress auto-retry cycle (see the STOP
+/// button rendered for a "resending"/"awaiting-ack" entry). Leaves the
+/// message as already-sent -- stopping isn't undoing the send, just giving
+/// up on hearing back.
+function stopDeliveryRetry(id) {
+  const pending = pendingDeliveries.get(id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingDeliveries.delete(id);
+  updateHistoryEntry(id, "tx", { status: "sent" });
+}
+
+/// Sends a delivery confirmation for a message this device just finished
+/// decoding. Best-effort and fire-and-forget from the caller's point of
+/// view (see `handleDecodedFrame`) -- a failed ack just means the sender's
+/// own retry timer eventually tries again or gives up, nothing to show the
+/// receiving side for that.
+async function sendAckFor(id, mode) {
+  try {
+    const pcm = build_ack_pcm(mode, undefined, undefined, hexToBytes(id));
+    await playPcm(pcm, SR);
+  } catch {
+    // best-effort, see above
+  }
 }
 
 async function resendOwnMessage(id) {
@@ -620,6 +757,14 @@ modeKeys.forEach((key) => {
     selectedMode = key.dataset.mode;
     modeKeys.forEach((k) => k.classList.toggle("active", k === key));
   });
+});
+
+retryCountInput.value = String(maxRetries);
+retryCountInput.addEventListener("change", () => {
+  const n = parseInt(retryCountInput.value, 10);
+  maxRetries = Number.isFinite(n) && n >= 0 && n <= 20 ? n : DEFAULT_MAX_RETRIES;
+  retryCountInput.value = String(maxRetries); // reflect any clamping back
+  saveMaxRetries(maxRetries);
 });
 
 // ============================= receive: live mic =============================
@@ -781,6 +926,7 @@ function handleDecodedFrame(frame, mode) {
     }
     onLiveMessageComplete();
     ringBell();
+    sendAckFor(tag.id, mode); // fire-and-forget -- see sendAckFor
     // The buffer is never trimmed as it's consumed (only ever grows, up
     // to the hard MAX_BUFFER_SECONDS cap), so without this a long
     // listening session keeps re-materializing and re-scanning an
@@ -870,6 +1016,21 @@ async function pollCapture(buffer) {
     }
     if (nack) {
       await handleNackFound(nack);
+      resetCaptureBuffer();
+      return;
+    }
+
+    // Same no-position-tracking, rescans-the-whole-buffer shape as
+    // scan_for_nack above, for the same reason -- see its comment.
+    let ack;
+    try {
+      ack = scan_for_ack(buffer, captureSampleRate, mode);
+    } catch {
+      ack = null;
+    }
+    if (ack) {
+      const targetId = Array.from(ack.target_id).map((b) => b.toString(16).padStart(2, "0")).join("");
+      markDelivered(targetId);
       resetCaptureBuffer();
       return;
     }

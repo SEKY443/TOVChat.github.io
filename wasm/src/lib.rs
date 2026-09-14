@@ -389,6 +389,130 @@ pub fn scan_for_nack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Op
     Ok(None)
 }
 
+/// A parsed delivery confirmation, as returned by [`scan_for_ack`].
+/// `target_id` names which sent message it confirms -- callers correlate it
+/// against whatever id they tagged their own sent messages with, the same
+/// way [`NackInfo`] does.
+#[wasm_bindgen]
+pub struct AckInfo {
+    dest_id: u8,
+    src_id: u8,
+    target_id: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl AckInfo {
+    #[wasm_bindgen(getter)]
+    pub fn dest_id(&self) -> u8 {
+        self.dest_id
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn src_id(&self) -> u8 {
+        self.src_id
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn target_id(&self) -> Vec<u8> {
+        self.target_id.clone()
+    }
+}
+
+/// Encodes a delivery-confirmation signal (see `protocol::AckFrame`) into
+/// PCM. Same shape as [`build_nack_pcm`] -- short, no payload, no FEC
+/// budget beyond the 5-byte header's own protection.
+#[wasm_bindgen]
+pub fn build_ack_pcm(
+    mode: &str,
+    dest_id: Option<u8>,
+    src_id: Option<u8>,
+    target_id: &[u8],
+) -> Result<Vec<f32>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let target_id = parse_target_id(target_id)?;
+
+    let frame_codes = protocol::build_ack_frame(&protocol::AckFrame {
+        dest_id: dest_id.unwrap_or(BROADCAST_ID),
+        src_id: src_id.unwrap_or(UNKNOWN_SRC_ID),
+        target_id,
+    });
+    let symbols = modem::bytes_to_symbols(&frame_codes);
+    let audio = modem::modulate_frame(&symbols, profile.symbol_duration_s, profile.guard_s, modem::SR);
+    Ok(audio.into_iter().map(|s| s as f32).collect())
+}
+
+/// Scans `samples` for the first delivery-confirmation signal, ignoring any
+/// ordinary data or NACK frames encountered along the way. Same structure
+/// and same "`None` means none found yet, not an error" contract as
+/// [`scan_for_nack`].
+#[wasm_bindgen]
+pub fn scan_for_ack(samples: &[f32], sample_rate: u32, mode: &str) -> Result<Option<AckInfo>, JsValue> {
+    let profile = resolve_mode(mode)?;
+    let sr = sample_rate;
+    let audio: Vec<f64> = samples.iter().map(|&s| sanitize_sample(s)).collect();
+
+    let step_n = ((profile.symbol_duration_s + profile.guard_s) * sr as f64) as usize;
+    let preamble_len_n = (modem::PREAMBLE_DURATION_S * sr as f64) as usize;
+    if step_n == 0 || preamble_len_n == 0 {
+        return Err(JsValue::from_str(&format!(
+            "unusable sample rate ({sr}Hz) for the requested timing -- expected something close \
+             to {}Hz",
+            modem::SR
+        )));
+    }
+
+    let reference = modem::generate_preamble(
+        modem::PREAMBLE_DURATION_S,
+        modem::PREAMBLE_F0,
+        modem::PREAMBLE_F1,
+        sr,
+    );
+    let mut search_start = 0usize;
+
+    while search_start < audio.len() {
+        let Some((abs_offset, _score)) = scan_for_preamble(&audio, search_start, &reference, sr)
+        else {
+            break;
+        };
+        let payload_start = abs_offset + (modem::PREAMBLE_GUARD_S * sr as f64) as usize;
+        let available = audio.len().saturating_sub(payload_start);
+        let n_symbols = (available / step_n).min(MAX_SYMBOLS_PER_FRAME);
+
+        let detections = modem::demodulate(
+            &audio[payload_start..],
+            n_symbols,
+            profile.symbol_duration_s,
+            profile.guard_s,
+            sr,
+            0,
+        );
+        let symbols: Vec<u8> = detections.iter().map(|d| d.symbol).collect();
+        let n_bytes = (symbols.len() * modem::BITS_PER_SYMBOL as usize) / 8;
+        let frame_codes = modem::symbols_to_bytes(&symbols, n_bytes);
+
+        if let Some(ack) = protocol::parse_ack_frame(&frame_codes) {
+            return Ok(Some(AckInfo {
+                dest_id: ack.dest_id,
+                src_id: ack.src_id,
+                target_id: ack.target_id.to_vec(),
+            }));
+        }
+
+        if let Some(consumed_codes) =
+            protocol::frame_wire_length(&frame_codes, 0, fec::DEFAULT_PARITY_BYTES)
+        {
+            let consumed_symbols = (consumed_codes * 8).div_ceil(6);
+            let exact_end = payload_start + consumed_symbols * step_n;
+            search_start =
+                payload_start.max(exact_end.saturating_sub((PREAMBLE_BACKOFF_S * sr as f64) as usize));
+        } else {
+            search_start = abs_offset + preamble_len_n;
+        }
+    }
+
+    Ok(None)
+}
+
 /// Encodes `chunks` as a sequence of independently-addressed frames (one
 /// per chunk, `seq` = index, `more_frames` = not the last one) -- unlike
 /// [`encode_to_pcm`], which hands one whole string to

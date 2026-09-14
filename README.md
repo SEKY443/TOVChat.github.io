@@ -218,7 +218,7 @@ typewriter-key-styled controls.
     "mic hearing something too quiet/unclean to demodulate" — this makes
     that distinction visible instead of needing an ad-hoc script to
     measure it.
-- **Resend**, both directions:
+- **Resend**, three ways:
   - A sent message always gets a local one-click resend (replays from
     its stored chunks/settings, no audio round trip needed).
   - A received message — complete or still incomplete — gets **request
@@ -227,7 +227,26 @@ typewriter-key-styled controls.
     naming its message id. The listen loop also polls `scan_for_nack`;
     hearing a NACK for a message id in this browser's own sent history
     triggers an automatic resend — no manual action needed on the
-    sender's side, as long as it's listening.
+    sender's side, as long as it's listening. This needs the receiver to
+    already have decoded *something* (to know a message id exists to ask
+    for) — no help when nothing decoded at all, which is exactly when a
+    resend matters most. **Automatic delivery retry** (below) fixes that
+    by having the sender drive retry instead.
+  - **Automatic delivery retry**: sending a message starts a retry cycle
+    — listen for a new `AckFrame` (mirrors `NackFrame`'s wire structure;
+    see `textovervoice-core`) naming that message's id, and if none
+    arrives within a grace period after the message finishes playing,
+    resend automatically. Unlike request-resend, this needs nothing from
+    the receiver but successfully decoding and sending back one short ack
+    — works even when the *first* attempt was never heard at all. Every
+    successful `handleDecodedFrame` completion now fires one of these
+    back automatically. Retry count is user-configurable (the machine
+    bar's "RETRIES" field, default 3, persisted); an in-progress retry
+    shows live status (`AWAITING ACK` → `RESENDING (n/N)` →
+    `✓ DELIVERED` or `✕ UNDELIVERED`) and can be cancelled early with
+    STOP. In-memory only — a page reload doesn't resume a retry cycle
+    from before it, same tradeoff as the rest of this app's live-session
+    state.
 - **Calibrate** (the machine bar's "▸ CALIBRATE" link) — mirrors the CLI's
   `calibrate-send`/`calibrate-listen`: find which `(mode, parity_bytes)`
   setting(s) actually survive this specific real channel, instead of
@@ -245,6 +264,33 @@ typewriter-key-styled controls.
   discrimination property itself — a probe encoded under one setting does
   not falsely match when scanned under a different one — via the
   compiled `.wasm` binary directly.
+
+  **Found live, after the above was already working**: calibrate reported
+  "no match" for candidates that were actually fine, just caught
+  mid-transmission by a still-growing buffer. `pollCapture` (ordinary
+  chat) already holds and retries a frame caught this way instead of
+  reporting a hard failure and skipping past it (see the sixth
+  acoustic-debugging round below); `pollCalibrateCapture` had no
+  equivalent and eagerly advanced past every failed attempt regardless of
+  cause. Now shares the same `TRUNCATION_REASONS` hold-and-retry logic,
+  keyed per candidate instead of per mode.
+
+- **Self-hearing, found live**: a device with LISTEN on while it also
+  sends — completely normal single-device usage, not just the two-tab
+  test below — had its own mic pick up its own speaker's output,
+  acoustically coupled on the same machine, and "receive" its own
+  transmission back as if it were incoming. `playPcm` is the one choke
+  point every send path goes through (message send, resend, calibrate
+  probes, an automatic NACK/ack-triggered resend), so it now suppresses
+  the capture buffer for the duration of playback plus a short
+  reverb-decay tail, rather than patching each call site separately.
+- **Live text reveal**: a received message's chat bubble now types its
+  text in character by character as it's decoded (or as each frame of a
+  multi-frame message arrives), reusing the same reveal timing the
+  real-time decode readout box already used, instead of the text just
+  appearing fully formed the instant a frame completes. History loaded
+  from storage on page load is seeded as already-fully-revealed so a
+  reload never replays the animation for old messages.
 
 Verified live against the deployed site in a real browser (Chrome):
 username gate, send (real speaker playback, history rendering), local

@@ -370,6 +370,24 @@ button, input, textarea {
   font-family: inherit;
 }
 
+.retry-config {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: #b9b4a8;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.retry-config input {
+  width: 2.6em;
+  background: transparent;
+  border: 1px solid #7a756c;
+  color: #f7f5ee;
+  font-family: inherit;
+  font-size: 9px;
+  padding: 2px 3px;
+}
+
 .footnote { font-size: 9px; letter-spacing: 1.5px; color: #7a756c; }
 
 /* ============================= calibration panel ============================= */
