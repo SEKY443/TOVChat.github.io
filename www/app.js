@@ -717,8 +717,18 @@ function updateMicLevelDisplay(peak) {
 }
 
 async function startCapture(onPoll) {
+  // echoCancellation/noiseSuppression stay off -- both are voice-optimized
+  // and can treat a steady tone as "noise" to suppress, which would
+  // directly corrupt the modem's frequencies. autoGainControl is just
+  // uniform amplitude scaling, not frequency-selective, so it's safe and
+  // was re-enabled after live testing found it was the actual gap: a
+  // recorded file (which passed through a recording app's own automatic
+  // leveling) decoded fine via DECODE FROM FILE, while the live capture
+  // (deliberately AGC-off) of the identical real-world weak signal did
+  // not -- confirming the raw signal was clean enough, just too quiet
+  // without any gain applied.
   mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
   });
 
   const ctx = await ensureAudioContext();
