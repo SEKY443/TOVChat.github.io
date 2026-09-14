@@ -9,6 +9,21 @@ import init, {
 
 const SR = 8000; // modem::SR -- outgoing PCM is always synthesized at this rate
 
+// ============================= debug log =============================
+//
+// A structured, always-on trail of the internal lifecycle events that
+// actually matter for figuring out what happened during a real acoustic
+// session -- frame scan attempts, ack/nack/retry state changes, carrier
+// sense, reveal timing -- readable straight from the browser's own
+// console (F12 -> Console, or filter for "[TOV") instead of needing to
+// watch the screen and catch a fast-moving state in a screenshot. Quiet
+// by design: skips the "polled, found nothing" case that fires every
+// ~1.2s while idle, so a filtered console stays readable during a long
+// listening session instead of scrolling past mostly noise.
+function dbg(tag, ...args) {
+  console.log(`[TOV:${tag}]`, ...args);
+}
+
 // Still persisted -- a device preference, not session content, unlike
 // username/history (see the "storage" section below).
 const STORAGE_MAX_RETRIES = "tovchat_max_retries";
@@ -703,6 +718,7 @@ async function sendMessage() {
   }
 
   textInput.value = "";
+  dbg("send", id, selectedMode, JSON.stringify(raw.slice(0, 60)));
   addHistoryEntry({
     id,
     dir: "tx",
@@ -745,12 +761,14 @@ async function attemptDeliveryRetry(id) {
   if (!pending) return; // acked or stopped since this timer was scheduled
 
   if (pending.attempt >= maxRetries) {
+    dbg("undelivered", id, "gave up after", maxRetries, "attempts");
     pendingDeliveries.delete(id);
     updateHistoryEntry(id, "tx", { status: "undelivered" });
     return;
   }
 
   pending.attempt += 1;
+  dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", RETRY_ACK_GRACE_MS + "ms");
   updateHistoryEntry(id, "tx", { status: "resending", attempt: pending.attempt });
   try {
     const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined);
@@ -771,6 +789,7 @@ async function attemptDeliveryRetry(id) {
 function markDelivered(id) {
   const pending = pendingDeliveries.get(id);
   if (!pending) return;
+  dbg("delivered", id, `after ${pending.attempt} resend(s)`);
   clearTimeout(pending.timer);
   pendingDeliveries.delete(id);
   updateHistoryEntry(id, "tx", { status: "delivered" });
@@ -794,11 +813,12 @@ function stopDeliveryRetry(id) {
 /// own retry timer eventually tries again or gives up, nothing to show the
 /// receiving side for that.
 async function sendAckFor(id, mode) {
+  dbg("ack-sent", id, mode);
   try {
     const pcm = build_ack_pcm(mode, undefined, undefined, hexToBytes(id));
     await playPcm(pcm, SR);
-  } catch {
-    // best-effort, see above
+  } catch (e) {
+    dbg("ack-sent-failed", id, e);
   }
 }
 
@@ -962,11 +982,19 @@ function hideLiveDecode() {
 // the animation had simply stopped partway through).
 async function typewriterReveal(fullText, startAt, onDone) {
   const token = ++liveDecodeRevealToken;
+  const startedAt = performance.now();
+  dbg("reveal-start", `${startAt}->${fullText.length} chars`, "token=" + token);
   for (let i = startAt; i < fullText.length; i++) {
-    if (token !== liveDecodeRevealToken) return; // superseded by a newer reveal
+    if (token !== liveDecodeRevealToken) {
+      dbg("reveal-superseded", "token=" + token, "at char", i, "of", fullText.length);
+      return;
+    }
     await flickerInChar((t) => { liveDecodeTextEl.textContent = t; }, fullText.slice(0, i), fullText[i]);
   }
-  if (token === liveDecodeRevealToken && onDone) onDone();
+  if (token === liveDecodeRevealToken) {
+    dbg("reveal-done", "token=" + token, Math.round(performance.now() - startedAt) + "ms");
+    if (onDone) onDone();
+  }
 }
 
 function onLiveFrame(frame, onRevealDone) {
@@ -1017,6 +1045,7 @@ function handleDecodedFrame(frame, mode) {
   const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
   onLiveFrame(frame, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined);
   if (result.ok) {
+    dbg("complete", tag.id, alreadyReceived ? "(duplicate resend)" : "(new)", JSON.stringify(result.text.slice(0, 60)));
     const updated = updateHistoryEntry(tag.id, "rx", {
       status: "received",
       text: result.text,
@@ -1099,12 +1128,15 @@ async function pollCapture(buffer) {
       }
       if (!frame) break;
 
+      dbg("scan", mode, "pos=" + pos, "ok=" + frame.ok, frame.ok ? "" : frame.reason, "next=" + frame.next_start);
+
       if (!frame.ok && TRUNCATION_REASONS.has(frame.reason)) {
         if (scanStuckSince[mode] === null) scanStuckSince[mode] = Date.now();
         if (Date.now() - scanStuckSince[mode] < TRUNCATION_RETRY_TIMEOUT_MS) {
           // Leave pos where it was -- don't report this as a failure, and
           // retry this exact position next poll once more of the
           // transmission has arrived, rather than skipping past it.
+          dbg("hold", mode, "stuck for", Date.now() - scanStuckSince[mode] + "ms", "reason=" + frame.reason);
           break;
         }
         // Waited long enough that this is more likely genuine corruption
@@ -1131,6 +1163,8 @@ async function pollCapture(buffer) {
       nack = null;
     }
     if (nack) {
+      const targetId = Array.from(nack.target_id).map((b) => b.toString(16).padStart(2, "0")).join("");
+      dbg("nack-recv", "target=" + targetId);
       await handleNackFound(nack);
       resetCaptureBuffer();
       return;
@@ -1146,6 +1180,7 @@ async function pollCapture(buffer) {
     }
     if (ack) {
       const targetId = Array.from(ack.target_id).map((b) => b.toString(16).padStart(2, "0")).join("");
+      dbg("ack-recv", "target=" + targetId);
       markDelivered(targetId);
       resetCaptureBuffer();
       return;
@@ -1186,12 +1221,18 @@ function updateMicLevelDisplay(peak) {
 /// blind, same as before this existed).
 async function waitForClearChannel() {
   if (!listening || currentMicPeak <= CARRIER_SENSE_BUSY_THRESHOLD) return; // common case: already clear
+  dbg("carrier-busy", "peak=" + currentMicPeak.toFixed(3), "waiting before transmit");
   const previousStatus = carriageStatus.textContent;
   const deadline = performance.now() + CARRIER_SENSE_MAX_WAIT_MS;
+  let waited = 0;
   while (currentMicPeak > CARRIER_SENSE_BUSY_THRESHOLD && performance.now() < deadline) {
     setCarriageStatus("● CHANNEL BUSY, WAITING…");
-    await sleep(CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS);
+    const backoff = CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS;
+    waited += backoff;
+    await sleep(backoff);
   }
+  const timedOut = performance.now() >= deadline;
+  dbg("carrier-clear", timedOut ? "gave up waiting after" : "channel clear after", Math.round(waited) + "ms");
   setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
 }
 
@@ -1409,6 +1450,7 @@ function pollCalibrateCapture(buffer) {
       }
 
       if (frame.ok && frame.text === code) {
+        dbg("calibrate-match", key);
         calibrateMatches.add(key);
         renderCalibrateResults();
         setCalibrateStatus(`● MATCH: ${mode.toUpperCase()} / PARITY ${parity} ●`);

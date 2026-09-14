@@ -415,6 +415,24 @@ enabled) — a subpath, not the domain root, since the GitHub account is
 for that. `.github/workflows/deploy.yml` builds the wasm module fresh and
 redeploys on every push to `main`.
 
+## Debugging
+
+`app.js` logs its internal lifecycle to the browser console, always on --
+open DevTools (F12) → Console and filter for `[TOV` to see it without the
+usual noise of scanning-and-finding-nothing that fires every ~1.2s while
+idle. Covers: every frame scan attempt (`[TOV:scan]`, mode/position/
+ok-or-reason), truncation hold-and-retry (`[TOV:hold]`), a completed
+message (`[TOV:complete]`, including whether it was a fresh decode or a
+duplicate resend), acks and nacks sent/received
+(`[TOV:ack-sent]`/`[TOV:ack-recv]`/`[TOV:nack-recv]`), the delivery retry
+cycle (`[TOV:retry]`/`[TOV:delivered]`/`[TOV:undelivered]`), collision
+avoidance (`[TOV:carrier-busy]`/`[TOV:carrier-clear]`), the live-decode
+reveal's own timing (`[TOV:reveal-start]`/`[TOV:reveal-done]`/
+`[TOV:reveal-superseded]`), a send (`[TOV:send]`), and a calibrate match
+(`[TOV:calibrate-match]`). Meant to make a real acoustic session
+verifiable from the actual internal state and its timing, not just by
+watching the screen and hoping a screenshot lands at the right moment.
+
 ## Building locally
 
 ```sh
