@@ -1021,7 +1021,8 @@ async function sendMessage() {
 }
 
 /// How long to wait for an ack before treating it as lost, scaled by how
-/// many messages THIS device currently has simultaneously awaiting one.
+/// many messages THIS device currently has simultaneously awaiting one,
+/// AND by how many attempts this particular message has already made.
 /// Found live: sending several messages in quick succession left one of
 /// them UNDELIVERED even though the receiver's own console proved it had
 /// genuinely decoded and acked every single one -- just later than any
@@ -1029,12 +1030,27 @@ async function sendMessage() {
 /// shares this device's own serialized playPcm queue for its resends, so
 /// a bigger backlog genuinely takes proportionally longer to work
 /// through even when nothing is actually lost -- a false "undelivered"
-/// caused by a real, self-created backlog, not a real loss. Scaling the
-/// wait by that backlog directly addresses it without loosening the
-/// budget for the common case: a single message in flight still gets
-/// exactly the base grace period.
-function currentDeliveryGraceMs() {
-  return RETRY_ACK_GRACE_MS * Math.max(1, pendingDeliveries.size);
+/// caused by a real, self-created backlog, not a real loss. Scaling by
+/// pendingDeliveries.size directly addresses that.
+///
+/// Found live again, re-testing with two receivers and four messages:
+/// still one straggler, even sent on its own with this device's own
+/// backlog back down to 1. The congestion this time was invisible to the
+/// sender entirely -- on the RECEIVER's side: it owed acks for several
+/// other messages first (plus a duplicate, since one of those had needed
+/// its own resend), each with a real carrier-sense wait and this app's
+/// own mandatory post-transmission listening gap in between, all sharing
+/// the receiver's own queue the exact same way this device's queue works.
+/// The sender has no visibility into that queue depth to scale against
+/// directly -- but it DOES know how many times it's already tried this
+/// particular message, which is a reasonable proxy for "this is taking
+/// longer than normal, be more patient": each attempt gets progressively
+/// more room, capped at 3x so a genuinely-lost message (no congestion at
+/// all, really gone) still gets reported in bounded time rather than
+/// growing without limit.
+function currentDeliveryGraceMs(attempt) {
+  const attemptScale = Math.min(attempt + 1, 3);
+  return RETRY_ACK_GRACE_MS * Math.max(1, pendingDeliveries.size) * attemptScale;
 }
 
 /// Schedules the next auto-resend check for `id` -- called once right
@@ -1044,7 +1060,7 @@ function currentDeliveryGraceMs() {
 function scheduleDeliveryRetry(id) {
   const pending = pendingDeliveries.get(id);
   if (!pending) return;
-  const graceMs = currentDeliveryGraceMs();
+  const graceMs = currentDeliveryGraceMs(pending.attempt);
   pending.timer = setTimeout(() => attemptDeliveryRetry(id), graceMs);
 }
 
@@ -1060,7 +1076,7 @@ async function attemptDeliveryRetry(id) {
   }
 
   pending.attempt += 1;
-  dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", currentDeliveryGraceMs() + "ms", "(" + pendingDeliveries.size + " pending)");
+  dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", currentDeliveryGraceMs(pending.attempt - 1) + "ms", "(" + pendingDeliveries.size + " pending)");
   updateHistoryEntry(id, "tx", { status: "resending", attempt: pending.attempt });
   try {
     const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined);

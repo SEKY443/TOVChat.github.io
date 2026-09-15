@@ -548,6 +548,25 @@ typewriter-key-styled controls.
     give each one roughly triple the patience, matching how much longer
     the shared channel genuinely needs.
 
+    **Found live again, stress-testing with two receivers and four
+    messages this time**: three of four delivered — real progress — but
+    the straggler had been sent on its own, well after the others, with
+    this device's own backlog already back down to 1. The congestion
+    this time was invisible to the sender entirely: on the RECEIVER's
+    side, both listening devices owed acks for several earlier messages
+    first — plus a duplicate, since one of those had needed its own
+    resend — each with a real carrier-sense wait and this app's own
+    mandatory post-transmission listening gap between them, sharing the
+    receiver's own queue the exact same way this device's queue works.
+    The sender has no way to see that queue depth to scale against
+    directly — but it does know how many times it's already tried this
+    particular message, a reasonable proxy for "this is taking longer
+    than normal, be more patient." `currentDeliveryGraceMs` now also
+    scales by attempt number (capped at 3x, so a genuinely-lost message —
+    no congestion at all, really gone — still gets reported in bounded
+    time rather than growing without limit) on top of the backlog
+    scaling above.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
