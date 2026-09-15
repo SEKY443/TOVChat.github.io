@@ -113,12 +113,28 @@ const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
 // Requested live: if receiving stalls part way through (signal lost, or a
 // resend never comes), the box would otherwise sit frozen showing a
-// half-decoded fragment forever -- nothing about scan_next_frame's own,
-// much longer TRUNCATION_RETRY_TIMEOUT_MS ever clears the DISPLAY, only the
-// underlying scan attempt. Checked by a lightweight watchdog interval, not
-// tied to polling cadence, since a stall is by definition "polling stopped
-// producing anything new."
-const LIVE_DECODE_STALL_TIMEOUT_MS = 20000;
+// half-decoded fragment forever -- nothing about scan_next_frame's own
+// TRUNCATION_RETRY_TIMEOUT_MS (see below, 120000ms) ever clears the
+// DISPLAY, only the underlying scan attempt. Checked by a lightweight
+// watchdog interval, not tied to polling cadence, since a stall is by
+// definition "polling stopped producing anything new."
+//
+// Found live: an early value here (20000ms) was much too aggressive --
+// fired mid-transmission on a real, still-arriving phone-mode message
+// (confirmed via the console: `[TOV:hold] phone stuck for 24014ms reason=
+// payload extends past end of received data`, i.e. scan_next_frame itself
+// still patiently waiting, not stuck). The preview genuinely can go 20+
+// real seconds between new demodulatable bytes on an ordinary, un-stalled,
+// just-slow single-frame transmission -- wiping the box at 20s wasn't
+// catching a stall, it was second-guessing the scan's own patience and
+// causing a real regression of its own (a false reset, then a full
+// preview rebuild colliding with the very same-poll cross-mode race this
+// file already documents fixes for above). Set comfortably above
+// TRUNCATION_RETRY_TIMEOUT_MS instead of an independent guess, so the box
+// only ever clears once the underlying scan itself would already have
+// given up and reported a real failure -- never while a legitimately slow
+// transmission is still genuinely in progress.
+const LIVE_DECODE_STALL_TIMEOUT_MS = 130000;
 const LIVE_DECODE_STALL_CHECK_MS = 2000;
 // Per-character flicker duration for newly-arrived (or newly-corrected)
 // live-preview text. Fixed and short -- unlike an earlier version of this

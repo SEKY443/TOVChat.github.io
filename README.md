@@ -452,7 +452,23 @@ typewriter-key-styled controls.
     of poll cadence) now clears the box back to `AWAITING SIGNAL` and
     flashes `SIGNAL LOST` if it hasn't moved forward
     (`liveDecodeLastProgressAt`, touched on every fresh track and every
-    `revealTo` call) in 20 seconds.
+    `revealTo` call) in long enough.
+
+    **Found live, immediately: the first timeout value (20 seconds) was
+    itself a bug.** Confirmed via the console:
+    `[TOV:live-decode-stalled] ... no progress for 20000ms` fired while
+    `[TOV:hold] phone stuck for 24014ms reason=payload extends past end of
+    received data` showed the underlying scan STILL PATIENTLY WAITING on a
+    real, still-arriving phone-mode transmission — not lost, just slow (a
+    real single-frame clip can legitimately run 30+ seconds with 20+
+    second gaps between new demodulatable bytes). The watchdog was
+    second-guessing the scan's own patience, wiping perfectly good
+    in-progress text and forcing a full preview rebuild — a real
+    regression from this feature itself, not a false alarm about a real
+    one. Raised to comfortably above `TRUNCATION_RETRY_TIMEOUT_MS`
+    (120000ms, the scan's own give-up point) instead of an independent
+    guess, so the box only ever clears once the underlying scan itself
+    would already have given up.
 
     **Requested live**: the outgoing side had no sense of progress either
     — just a static `TRANSMITTING…` for however long a clip takes (a real
