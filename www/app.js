@@ -168,6 +168,14 @@ const LIVE_PREVIEW_CHAR_MS = 40;
 const MIC_METER_UPDATE_MS = 80; // how often the level bar redraws, not how often it samples
 const MIC_METER_FULL_SCALE = 0.3; // amplitude that reads as a full bar -- real speech/tones rarely approach 1.0
 const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak before scanning it, if quieter
+// Requested live: a quiet sender should still decode, not just a
+// quiet-but-otherwise-clean one. Only the most recent NORMALIZE_WINDOW_S
+// seconds of the buffer are looked at when picking normalizePeak's gain --
+// see that function's own doc comment for why the peak used to come from
+// the WHOLE session-long buffer instead, and why that under-boosts
+// whatever's arriving right now after anything louder happened earlier in
+// the same listening session.
+const NORMALIZE_WINDOW_S = 6; // a few POLL_INTERVAL_MS cycles' worth of fresh audio, well under a typical frame's own duration
 
 // Collision avoidance, CSMA/CA-style (found live: two devices replying to
 // each other in quick succession is exactly the scenario where both can
@@ -1401,9 +1409,26 @@ function appendCaptureChunk(chunk) {
 /// step, no ramp-up needed. Uniform amplitude scaling only, same
 /// reasoning as autoGainControl being safe to enable: it doesn't touch
 /// frequency content the way noise suppression would.
-function normalizePeak(buffer) {
+///
+/// The PEAK used to come from the entire buffer captured since LISTEN was
+/// clicked, not just recently -- found live: a quiet, genuinely-decodable
+/// signal still failed after anything louder happened earlier in the same
+/// session (another message, a cough, a door). One loud moment set the
+/// gain for the whole rest of the session; a later quiet arrival only ever
+/// got boosted relative to THAT old peak, never enough to reach
+/// NORMALIZE_TARGET_PEAK on its own. Only scanning the most recent
+/// NORMALIZE_WINDOW_S seconds for the peak fixes that -- old, already-
+/// irrelevant loudness stops influencing today's gain -- while still
+/// applying the resulting gain UNIFORMLY across the whole buffer (not just
+/// the window), so an in-progress frame's earlier, already-arrived samples
+/// stay on the same scale as its newest ones. `sampleRate` is
+/// `captureSampleRate` at the one real call site (see startCapture) --
+/// threaded through explicitly rather than read from that module-level
+/// variable so this stays a pure function of its arguments.
+function normalizePeak(buffer, sampleRate) {
+  const windowStart = Math.max(0, buffer.length - Math.round(NORMALIZE_WINDOW_S * sampleRate));
   let peak = 0;
-  for (let i = 0; i < buffer.length; i++) {
+  for (let i = windowStart; i < buffer.length; i++) {
     const a = Math.abs(buffer[i]);
     if (a > peak) peak = a;
   }
@@ -2075,7 +2100,7 @@ async function startCapture(onPoll) {
       calibrateStuckSince = new Map();
       return;
     }
-    onPoll(normalizePeak(captureBuffer.subarray(0, captureLength)));
+    onPoll(normalizePeak(captureBuffer.subarray(0, captureLength), captureSampleRate));
   }, POLL_INTERVAL_MS);
 }
 

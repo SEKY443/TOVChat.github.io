@@ -548,6 +548,29 @@ typewriter-key-styled controls.
     default can't talk to a client on the new one (and vice versa) until
     it hard-reloads.
 
+    **Clarified live**: that FEC change is about correcting corrupted
+    bytes, not about detecting a quiet signal in the first place — not
+    what was actually being asked for. The real ask: a genuinely quiet
+    sender (weak mic, distant phone speaker) should still decode, not just
+    a quiet-but-otherwise-clean one — sensitivity, not accuracy.
+    `normalizePeak` already existed for exactly this (boosts a captured
+    buffer's peak up to `NORMALIZE_TARGET_PEAK` before scanning, added
+    earlier to close the gap between "a recorded file of the same signal
+    decodes fine via DECODE FROM FILE" and "the identical live signal
+    doesn't" — the browser's own real-time `autoGainControl` is
+    voice-tuned with too slow a ramp-up for a short tone burst). The bug:
+    it computed that peak from the ENTIRE buffer captured since LISTEN was
+    clicked, not just recently. One loud moment (another message, a cough,
+    a door) anywhere earlier in a listening session permanently set the
+    gain for the rest of it — a later quiet arrival only ever got boosted
+    relative to THAT old peak, never enough to reach the target on its
+    own. Now only looks at the most recent `NORMALIZE_WINDOW_S` (6)
+    seconds — a few `POLL_INTERVAL_MS` cycles' worth of fresh audio, well
+    under a typical frame's own duration — for the peak, while still
+    applying the resulting gain uniformly across the WHOLE buffer (not
+    just the window), so an in-progress frame's earlier, already-arrived
+    samples stay on the same scale as its newest ones.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
