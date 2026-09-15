@@ -571,6 +571,34 @@ typewriter-key-styled controls.
     just the window), so an in-progress frame's earlier, already-arrived
     samples stay on the same scale as its newest ones.
 
+    **Found live, immediately after**: "sometimes it gets stuck showing
+    the correct message" — a message that kept genuinely failing to
+    confirm (real channel trouble a given `PARITY_BYTES` can't always
+    fully overcome) and kept being auto-resent by its sender showed each
+    resend's preview restarting the WHOLE reveal from scratch, even though
+    the content was identical every time — read as "stuck, replaying,"
+    not "still trying." Confirmed by checking the actual received history
+    (`document.querySelectorAll('.slip')`) against what the preview had
+    shown: the content never once appeared as a real, confirmed message —
+    it was a genuinely failing repeated attempt, not a display glitch on a
+    successful one. But the id-based guards above (correctly) treat a
+    DIFFERENT id as a signal to protect the box from — and it turns out
+    the PREVIEW's own id parsing is speculative too, same as everything
+    else it reads before the header's own FEC has corrected it, so it can
+    come out slightly different between attempts even for byte-identical
+    resends of the same message. `updateLivePreview` now distinguishes
+    "different id, but the same content stream" (`tag.text` extends or is
+    extended by what's already shown) from "different id AND different
+    content" (the real noise-eviction case the guard exists for) — only
+    the latter is still refused; the former silently adopts the new id and
+    keeps building on what's already shown. The empty-buffer case (nothing
+    shown yet) still falls through to the strict block, protecting the
+    char-0 window the id-only guard exists for in the first place. Makes
+    repeated failed attempts of the same message look continuous instead
+    of restarting — it does not fix WHY a given attempt keeps failing to
+    confirm in the first place, which is a real channel/audio-quality
+    question CALIBRATE is the tool for, not this box.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history

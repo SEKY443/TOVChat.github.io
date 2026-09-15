@@ -1693,7 +1693,28 @@ function updateLivePreview(mode) {
   // only ever delay the real message's preview, never replace its
   // eventual confirmed content.
   if (liveDecodeId !== null && tag.id !== liveDecodeId && !liveDecodeCompleted) {
-    return;
+    // Found live: even past the fixes above, a message that keeps failing
+    // to actually confirm (genuine channel trouble -- see PARITY_BYTES)
+    // and keeps getting auto-resent by its sender showed each resend's
+    // preview restarting the WHOLE reveal from scratch, even though the
+    // content was identical every time -- reading as "stuck, replaying
+    // the same thing" rather than "still trying." Cause: unlike the
+    // confirmed text, the PREVIEW's own id parsing is speculative too (see
+    // preview_frame's doc comment) -- it can come out slightly different
+    // between attempts even for byte-identical repeats of the same
+    // message, since the header bits it's read from haven't been through
+    // the header's own FEC correction yet, only the payload has by the
+    // time this runs. Distinguishing "different id, but the same content
+    // stream" from "different id AND different content" (the real
+    // noise-eviction case the guard above exists for) lets the former
+    // silently adopt the new id and keep building on what's already
+    // shown, instead of wiping it. Content-blank (nothing shown yet)
+    // still falls through to the strict block above it -- that's the
+    // char-0 window the id-only version of this guard exists to protect,
+    // and an empty string would trivially "match" any content otherwise.
+    const contentMatches = liveDecodeShown.length > 0 && (tag.text.startsWith(liveDecodeShown) || liveDecodeShown.startsWith(tag.text));
+    if (!contentMatches) return;
+    liveDecodeId = tag.id;
   }
 
   ensureLiveDecodeTracking(tag.id, tag.username, mode);
