@@ -547,6 +547,17 @@ let currentMicPeak = 0; // last-measured mic peak, refreshed every MIC_METER_UPD
 const receivedMessageIds = new Set();
 
 let liveDecodeId = null; // message id currently shown in the live decode box
+// Which LISTEN_MODES entry liveDecodeId is actually arriving on. See
+// updateLivePreview's early bail: pollCapture scans every mode against the
+// same raw buffer every poll with no `await` between them, so the mode
+// NOT carrying the real signal got a chance to compute and apply its own
+// (bogus, noise-derived) preview in the same synchronous tick as the real
+// mode's -- before the real mode's revealTo call had gotten far enough to
+// commit anything, so the id-theft guard's own liveDecodeId check hadn't
+// yet seen anything to protect. Skipping the other mode's scan entirely,
+// once one mode has locked onto a message, closes that same-tick window
+// instead of only reacting to it after the fact.
+let liveDecodeMode = null;
 let liveDecodeUsername = "";
 // Text already CONFIRMED (via a real, FEC/CRC-verified scan_next_frame
 // result) for liveDecodeId, across however many of its frames have
@@ -1051,6 +1062,23 @@ function updateHistoryEntry(id, dir, patch) {
   return true;
 }
 
+// Requested live: a long paste (observed live with an entire HTML source
+// file pasted in) used to become ONE multi-frame message, all its frames
+// concatenated into a single continuous transmission -- for enough text,
+// several minutes of unbroken audio, with no delivery confirmation and no
+// per-piece recovery until every last frame of it had arrived. Any one
+// channel hiccup anywhere in that whole span corrupted the entire
+// message, and "cannot decode the long text" was the result. Splitting at
+// the MESSAGE level instead -- each piece its own independently tracked
+// message, own id, own ack/retry cycle -- bounds any single transmission
+// to one frame's real over-the-air duration (already exercised
+// extensively as ordinary single-frame sends elsewhere in this file) and
+// means a lost piece only costs that piece's own resend, not a full
+// re-transmission of everything. Reuses CHUNK_TEXT_CHARS as the split
+// boundary rather than inventing a second, independent limit -- one frame
+// per message is the simplest bound that's already proven reliable.
+const MESSAGE_SPLIT_CHARS = CHUNK_TEXT_CHARS;
+
 async function sendMessage() {
   const raw = textInput.value;
   if (raw.trim().length === 0) return;
@@ -1072,9 +1100,22 @@ async function sendMessage() {
     await startListening();
   }
 
+  textInput.value = "";
+  const pieces = chunkText(raw, MESSAGE_SPLIT_CHARS);
+  for (let i = 0; i < pieces.length; i++) {
+    await sendOneMessage(pieces[i], pieces.length > 1 ? `${i + 1}/${pieces.length}` : null);
+  }
+}
+
+/// Sends exactly one message-worth of text (already within
+/// MESSAGE_SPLIT_CHARS -- see sendMessage) as its own independently
+/// tracked send: own id, own history entry, own ack/retry cycle. `part`,
+/// when given, is just a sender-local status label (`PART 2/3`) -- never
+/// injected into the actual text sent, which stays exactly what the user
+/// typed for that piece.
+async function sendOneMessage(raw, part) {
   const id = randomMsgId();
-  const textChunks = chunkText(raw, CHUNK_TEXT_CHARS);
-  const taggedChunks = textChunks.map((c) => tagChunk(id, username, c));
+  const taggedChunks = chunkText(raw, CHUNK_TEXT_CHARS).map((c) => tagChunk(id, username, c));
 
   let pcm;
   try {
@@ -1084,8 +1125,7 @@ async function sendMessage() {
     return;
   }
 
-  textInput.value = "";
-  dbg("send", id, selectedMode, JSON.stringify(raw.slice(0, 60)));
+  dbg("send", id, selectedMode, part ? `part ${part}` : "", JSON.stringify(raw.slice(0, 60)));
   addHistoryEntry({
     id,
     dir: "tx",
@@ -1097,10 +1137,11 @@ async function sendMessage() {
     status: "sent",
   });
 
+  const label = part ? `● TRANSMITTING PART ${part}…` : "● TRANSMITTING…";
   sendKey.disabled = true;
-  setCarriageStatus("● TRANSMITTING…");
+  setCarriageStatus(label);
   try {
-    await playPcm(pcm, SR, (fraction) => setCarriageStatus(`● TRANSMITTING… ${Math.round(fraction * 100)}%`));
+    await playPcm(pcm, SR, (fraction) => setCarriageStatus(`${label} ${Math.round(fraction * 100)}%`));
   } finally {
     sendKey.disabled = false;
     setCarriageStatus(listening ? "● LISTENING…" : "▢ TYPE YOUR MESSAGE ▢");
@@ -1394,6 +1435,7 @@ function flashLiveDecodeStatus(text) {
 
 function resetLiveDecode() {
   liveDecodeId = null;
+  liveDecodeMode = null;
   liveDecodeUsername = "";
   liveDecodeConfirmed = "";
   liveDecodeShown = "";
@@ -1422,9 +1464,10 @@ function hideLiveDecode() {
 /// concerned, not a continuation of the one it already finished showing.
 /// A no-op otherwise, so callers can call this unconditionally on every
 /// preview/confirmation without checking either condition themselves.
-function ensureLiveDecodeTracking(id, username) {
+function ensureLiveDecodeTracking(id, username, mode) {
   if (id === liveDecodeId && !liveDecodeCompleted) return;
   liveDecodeId = id;
+  liveDecodeMode = mode;
   liveDecodeUsername = username;
   liveDecodeConfirmed = "";
   liveDecodeShown = "";
@@ -1542,6 +1585,17 @@ function onLiveMessageComplete() {
 /// FEC/CRC-verified result confirms or corrects it.
 function updateLivePreview(mode) {
   if (liveDecodeEl.hidden) return;
+  // Skip this mode entirely once a DIFFERENT mode has already locked onto
+  // an in-progress message -- see liveDecodeMode's doc comment. Cheaper
+  // than the id-based guard further down (skips the preview_frame call
+  // altogether) and, more importantly, closes it at the source: pollCapture
+  // calls every mode's updateLivePreview back to back with no `await`
+  // between them, so without this, the other mode's own call could still
+  // run its preview_frame + tag parsing in the SAME synchronous tick as
+  // this mode's revealTo call -- before that call had gotten far enough to
+  // commit anything -- and independently pass every guard below on its own
+  // (bogus) target.
+  if (liveDecodeId !== null && !liveDecodeCompleted && mode !== liveDecodeMode) return;
   let preview;
   try {
     preview = preview_frame(captureBuffer.subarray(0, captureLength), captureSampleRate, mode, scanPos[mode], undefined);
@@ -1596,7 +1650,7 @@ function updateLivePreview(mode) {
     return;
   }
 
-  ensureLiveDecodeTracking(tag.id, tag.username);
+  ensureLiveDecodeTracking(tag.id, tag.username, mode);
   clearTimeout(liveDecodeStatusRestoreTimer);
   setLiveDecodeStatus(steadyLiveDecodeStatus());
   const target = liveDecodeConfirmed + tag.text;
@@ -1662,7 +1716,7 @@ function handleDecodedFrame(frame, mode) {
   // see updateLivePreview's matching guard for why a duplicate leaves the
   // box alone entirely.
   if (!liveDecodeEl.hidden && !alreadyReceived) {
-    ensureLiveDecodeTracking(tag.id, tag.username);
+    ensureLiveDecodeTracking(tag.id, tag.username, mode);
     liveDecodeConfirmed += tag.text;
     clearTimeout(liveDecodeStatusRestoreTimer);
     setLiveDecodeStatus(steadyLiveDecodeStatus());

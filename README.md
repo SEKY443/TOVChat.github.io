@@ -479,6 +479,52 @@ typewriter-key-styled controls.
     playback; `sendMessage` and `resendOwnMessage` wire it into the
     carriage-status line — `● TRANSMITTING… 42%` / `● RESENDING… 42%`.
 
+    **Still a residual wobble at the very start of a message, confirmed
+    live a sixth time.** With the char-0 gap closed, the SAME kind of race
+    could still catch char 1 (or, rarely, a later early character) for a
+    couple of iterations before settling — "Fi" briefly reverting to "F" +
+    scrambled bits, self-correcting within a few seconds, never touching
+    the eventually-delivered text. Traced with a direct `console.log`
+    interceptor (the read-console tool itself was, confusingly, replaying
+    stale entries from far earlier in the session at this point — see the
+    note added to "Debugging" below) to `pollCapture`'s own structure:
+    it calls `updateLivePreview(mode)` for every `LISTEN_MODES` entry back
+    to back with no `await` between them, so if the mode NOT carrying the
+    real signal manages its own plausible-looking parse of the SAME poll's
+    buffer, it can run its whole guard chain and call `revealTo` in the
+    exact same synchronous tick as the real mode's call — before that
+    call's own `revealTo` has gotten far enough into its first `await` to
+    commit anything back to `liveDecodeShown`. The id-based guards above
+    only react after a call has been let through; this reaches earlier.
+    Added `liveDecodeMode`, recording which mode the box is actually
+    locked onto, and `updateLivePreview` now skips a non-matching mode
+    entirely — before even calling `preview_frame` — the instant any mode
+    has locked onto an in-progress message. `handleDecodedFrame`'s
+    authoritative confirm path is untouched, so a genuinely different real
+    message arriving on the other mode still wins once it actually
+    confirms (FEC/CRC-verified) — this only stops that mode's own
+    unconfirmed PREVIEW from being computed at all in the meantime.
+
+    **Also requested live, while investigating the wobble above**: very
+    long pastes (an entire HTML source file, tested live) were becoming
+    ONE multi-frame message — every frame concatenated into a single
+    continuous transmission, several minutes of unbroken audio for enough
+    text, no delivery confirmation and no per-piece recovery until every
+    frame had arrived. Any one channel hiccup anywhere in that whole span
+    corrupted the entire message — the actual cause of "cannot decode the
+    long text." `sendMessage` now splits at the MESSAGE level first
+    (`chunkText(raw, MESSAGE_SPLIT_CHARS)`, reusing `CHUNK_TEXT_CHARS` —
+    700 — as the boundary rather than inventing a second limit), sending
+    each piece through the new `sendOneMessage` helper as its own fully
+    independent message: own id, own history entry, own ack/retry cycle.
+    Bounds any single transmission to one frame's real over-the-air
+    duration (already exercised extensively elsewhere in this file as
+    ordinary single-frame sends) and means a lost piece only costs that
+    piece's own resend, never a retransmission of the whole paste. The
+    split text itself is never altered (no part markers injected into what
+    actually gets sent) — only the sender's own status line shows
+    `● TRANSMITTING PART 2/3… 42%` while it's happening.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
