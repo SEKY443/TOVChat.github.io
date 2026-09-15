@@ -153,9 +153,37 @@ const SQUELCH_BUSY_MULTIPLIER = 4.0;
 const SQUELCH_MIN_FLOOR = 0.0005; // absolute floor so a near-silent source doesn't call every nonzero signal "busy"
 let squelchFast = 0;
 let squelchFloor = 0;
+let squelchSeeded = false; // see squelchUpdate's first-call bootstrap
 
+/// Found live: this ported the CLI's Squelch::update faithfully, but the
+/// port (and, on inspection, the reference it was ported from) has a real
+/// bootstrap bug. Both fast and floor start at 0, and the floor only ever
+/// updates while the CURRENT reading is judged "not busy" against the
+/// CURRENT floor -- so if the very first real ambient reading is already
+/// louder than the tiny MIN_FLOOR bootstrap value times the busy
+/// multiplier (threshold ~0.002 linear amplitude, about -54dBFS -- quieter
+/// than almost any real room's actual ambient noise), that first reading
+/// gets judged "busy" against a floor that hasn't been given a chance to
+/// calibrate yet, so the floor never updates, so fast (chasing the real,
+/// perfectly ordinary ambient level) stays "busy" forever: the channel
+/// reads permanently busy from the moment LISTEN turns on, `waitForClearChannel`
+/// always times out and transmits blind after CARRIER_SENSE_MAX_WAIT_MS
+/// regardless of what's actually on the channel -- collision avoidance in
+/// name only. Reproduced directly: feeding a steady, realistic ambient
+/// RMS of 0.01 (-40dBFS, an ordinary quiet room) through the unmodified
+/// port leaves the floor at exactly 0 and `is_busy()` permanently true
+/// after 300 updates. Fixed by seeding the floor directly from the first
+/// real reading (bypassing the gate for just that one sample, since there
+/// is no prior floor estimate yet to protect) -- every reading after that
+/// uses the normal gated EMA, unchanged.
 function squelchUpdate(rms) {
   if (!Number.isFinite(rms)) return; // guard against a pathological driver producing NaN/Infinity, same as the CLI's Squelch::update
+  if (!squelchSeeded) {
+    squelchFast = rms;
+    squelchFloor = rms;
+    squelchSeeded = true;
+    return;
+  }
   squelchFast = SQUELCH_FAST_ALPHA * rms + (1 - SQUELCH_FAST_ALPHA) * squelchFast;
   const effectiveFloor = Math.max(squelchFloor, SQUELCH_MIN_FLOOR);
   if (squelchFast < effectiveFloor * SQUELCH_BUSY_MULTIPLIER) {
@@ -170,6 +198,7 @@ function squelchIsBusy() {
 function squelchReset() {
   squelchFast = 0;
   squelchFloor = 0;
+  squelchSeeded = false;
 }
 
 const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks

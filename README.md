@@ -409,6 +409,33 @@ typewriter-key-styled controls.
     so this tracks each device's own actual surroundings instead of
     guessing at one number for all of them.
 
+    **Found live, and it was a real bug, not just a mirrored one**: the
+    port above is faithful to the CLI's actual `Squelch::update`, but that
+    reference implementation has a genuine bootstrap bug that its own test
+    suite happens not to exercise. Both `fast` and `floor` start at 0, and
+    the floor only ever updates while the *current* reading looks "not
+    busy" against the *current* floor — so if the very first real ambient
+    reading is already louder than the tiny `MIN_FLOOR` bootstrap value
+    times the busy multiplier (about -54dBFS, quieter than almost any real
+    room's actual noise floor), that first reading gets judged busy against
+    a floor that never got a chance to calibrate, so the floor never
+    updates, so the channel reads permanently busy from the moment LISTEN
+    turns on — confirmed directly: feeding a steady, realistic ambient RMS
+    of 0.01 (-40dBFS, an ordinary quiet room) through the unmodified port
+    leaves the floor at exactly 0 and `is_busy()` permanently `true` after
+    300 updates. In practice this meant `waitForClearChannel` always ran
+    out its full `CARRIER_SENSE_MAX_WAIT_MS` and transmitted blind
+    regardless of what was actually on the channel — collision avoidance
+    that never actually avoided anything, which is exactly what it looked
+    like live: an ack colliding with a real ongoing transmission it should
+    have waited out. Fixed by seeding the floor directly from the first
+    real reading instead of 0 — there's no prior estimate to protect on
+    that first sample anyway — with every reading after that going through
+    the normal gated EMA unchanged. Verified with the same synthetic
+    sequence: ambient calibrates correctly (`busy: false`), a real burst is
+    still detected (`busy: true`), and it recovers cleanly once the burst
+    ends.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
