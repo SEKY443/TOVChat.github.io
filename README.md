@@ -330,6 +330,26 @@ typewriter-key-styled controls.
     tentatively shown — still happens exactly as before, in
     `handleDecodedFrame`, untouched by this change.
 
+    **Still happened after the fix above, confirmed live**: the
+    grow-only guard in `updateLivePreview` was necessary but not
+    sufficient. The real bug was one level deeper, in `revealTo` itself —
+    it only committed `liveDecodeShown` once, at the very end of its own
+    flicker loop, not after each character resolved. If a NEWER reveal
+    (the next poll's preview update, a genuine forward extension per the
+    guard above) interrupted an in-progress one mid-flight — via the same
+    token-cancellation `revealTo` has always used — that newer call
+    computed its own starting point against `liveDecodeShown` to decide
+    where to begin, and found a stale, shorter value than what was
+    actually already painted onto the screen: the interrupted call's own
+    characters had been drawn via direct DOM updates inside its flicker
+    loop, just not yet reflected in the variable the next call trusted.
+    The newer reveal re-flickered from that stale point forward — visibly
+    replaying characters that had already resolved a moment earlier,
+    exactly the "restart from the middle" being reported. Fixed by
+    committing `liveDecodeShown` after every single character resolves,
+    not just once at the end, so any interrupting reveal always sees
+    precisely how far its predecessor actually got.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history

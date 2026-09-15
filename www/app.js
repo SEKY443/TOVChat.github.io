@@ -1368,14 +1368,19 @@ function ensureLiveDecodeTracking(id, username) {
 
 /// Animates the live-decode box from whatever it currently shows
 /// (`liveDecodeShown`) to `targetText`, character by character via
-/// `flickerInChar`, then commits `liveDecodeShown = targetText`. Finds the
-/// first point the two diverge and re-flickers only from there onward --
-/// so ordinary growth (new preview characters appended at the end) just
-/// flickers the new tail in, while a correction (the confirmed, FEC/CRC-
-/// verified text turns out to differ from what the raw preview had
-/// tentatively shown -- see handleDecodedFrame) visibly re-resolves from
-/// wherever it was actually wrong, instead of silently snapping to the
-/// right answer.
+/// `flickerInChar`, committing `liveDecodeShown` after each one resolves
+/// (not just once at the very end -- found live: a NEWER call can
+/// interrupt this one mid-flight via the token cancellation below, and
+/// that newer call trusts `liveDecodeShown` to know where to start; a
+/// stale value there made it re-flicker characters this call had already
+/// finished painting onto the screen, visible as the box seeming to
+/// "restart from the middle"). Finds the first point the two diverge and
+/// re-flickers only from there onward -- so ordinary growth (new preview
+/// characters appended at the end) just flickers the new tail in, while a
+/// correction (the confirmed, FEC/CRC-verified text turns out to differ
+/// from what the raw preview had tentatively shown -- see
+/// handleDecodedFrame) visibly re-resolves from wherever it was actually
+/// wrong, instead of silently snapping to the right answer.
 ///
 /// `onDone`, if given, only runs once this reveal reaches the end of
 /// `targetText` (not if a newer call -- a fresher preview, or the real
@@ -1409,9 +1414,19 @@ async function revealTo(targetText, onDone) {
       targetText[i],
       LIVE_PREVIEW_CHAR_MS
     );
+    // Committed incrementally, not just once at the very end -- found
+    // live: a newer reveal (the next poll's preview update, still a
+    // genuine forward extension per updateLivePreview's own check) can
+    // interrupt this one mid-flight via the token cancellation below.
+    // That newer call computes ITS OWN matchLen against liveDecodeShown
+    // to decide where to start -- if this call hadn't updated it since
+    // starting, the newer call would see a stale, shorter value than
+    // what's actually already painted onto the screen right now, and
+    // re-flicker characters this call already finished revealing. Real,
+    // visible symptom: the box appeared to "restart from the middle."
+    liveDecodeShown = targetText.slice(0, i + 1);
   }
   if (token !== liveDecodeRevealToken) return;
-  liveDecodeShown = targetText;
   liveDecodeTextEl.textContent = targetText;
   dbg("reveal-done", "token=" + token);
   if (onDone) onDone();
