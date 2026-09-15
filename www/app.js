@@ -202,7 +202,21 @@ function squelchReset() {
 }
 
 const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks
-const CARRIER_SENSE_MAX_WAIT_MS = 4000; // give up waiting and transmit anyway after this long
+// Found live, after fixing the squelch bootstrap deadlock above: acks were
+// STILL colliding with genuinely ongoing transmissions. Root cause was this
+// value, not the squelch -- 4s is nowhere near long enough. Directly
+// measured phone-mode transmissions elsewhere in this app taking 9-33+
+// real seconds (see the reveal-pacing/frameMs logging), so a channel that's
+// busy with one ordinary message routinely stays busy well past 4s of
+// genuinely correct "busy" readings -- the "give up and transmit anyway"
+// safety fallback was routinely firing DURING a real, still-arriving
+// transmission, not after some pathologically stuck reading. Raised to
+// comfortably exceed realistic worst-case single-message duration, the
+// same reasoning TRUNCATION_RETRY_TIMEOUT_MS below already uses for "how
+// long can a real transmission legitimately take" -- the fallback should
+// only ever fire for a genuinely stuck squelch, not a normal-length
+// message that just hasn't finished yet.
+const CARRIER_SENSE_MAX_WAIT_MS = 60000;
 // Found live with more than two listening devices: several receivers can
 // finish decoding the SAME broadcast frame at essentially the same instant
 // and each independently send its ack back. Every one of them checks the

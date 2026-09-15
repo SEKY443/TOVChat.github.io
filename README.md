@@ -436,6 +436,20 @@ typewriter-key-styled controls.
     still detected (`busy: true`), and it recovers cleanly once the burst
     ends.
 
+    **Found live again, right after the fix above**: acks were still
+    colliding with a genuinely ongoing transmission — this time the squelch
+    itself was correctly reporting busy the whole time, but
+    `CARRIER_SENSE_MAX_WAIT_MS` was only 4s, and this app's own logging
+    elsewhere had already directly measured real phone-mode transmissions
+    taking 9–33+ seconds. A channel legitimately busy with one ordinary
+    message routinely stays busy well past 4s of *correct* busy readings,
+    so the "give up and transmit anyway" safety fallback — meant to catch a
+    genuinely stuck squelch — was instead routinely firing in the middle of
+    a real, still-arriving message. Raised to 60s: comfortably past any
+    realistic single message's duration, the same "how long can a real
+    transmission legitimately take" reasoning `TRUNCATION_RETRY_TIMEOUT_MS`
+    below already uses.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
