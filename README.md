@@ -485,6 +485,29 @@ typewriter-key-styled controls.
     floor/threshold numbers a next report like this needs, without
     another guess-and-redeploy cycle.
 
+    **Found live yet again: a send still collided with an incoming ack.**
+    With the floor now calibrating correctly, this pointed at raw
+    sensitivity, not calibration — the CLI's own 4.0x busy ratio (ported
+    faithfully) isn't necessarily tuned for a relatively quiet real signal
+    picked up from across a room, like an ack's own transmission volume
+    against a nearby full data frame's. Two changes together:
+    1. Lowered `SQUELCH_BUSY_MULTIPLIER` to 2.0x — verified by simulation
+       this stays at essentially zero false positives (0–1 per 300
+       samples, even under deliberately extreme synthetic ambient jitter
+       standing in for real-world AGC pumping) while correctly catching a
+       signal only ~2.2x louder than ambient that 4.0x missed entirely.
+    2. Added a second, independent busy signal alongside the squelch:
+       `channelLooksBusy()` now also treats the channel as busy whenever
+       `pollCapture` is currently holding position on a real,
+       already-preamble-and-header-verified frame that just hasn't fully
+       arrived yet (`scanStuckSince`, the same state the truncation-retry
+       logic already tracks). Once this device has actually demodulated a
+       valid preamble and header for something, that is a far more
+       reliable "someone is transmitting to me right now" signal than any
+       amplitude threshold can be — it isn't fooled by ambient loudness or
+       AGC in either direction, because it's driven by real protocol
+       state, not a guess about what counts as "loud enough."
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.

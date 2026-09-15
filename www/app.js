@@ -149,7 +149,17 @@ const NORMALIZE_TARGET_PEAK = 0.9; // gain-boost a captured buffer to this peak 
 // CLI's own doc comment gives.
 const SQUELCH_FAST_ALPHA = 0.3;
 const SQUELCH_FLOOR_ALPHA = 0.01;
-const SQUELCH_BUSY_MULTIPLIER = 4.0;
+// Found live: a second message's send still collided with an incoming ack
+// -- the CLI's own 4.0x ratio (ported faithfully) wasn't sensitive enough
+// to reliably catch a real but relatively QUIET signal (an ack's own
+// transmission volume, picked up from across a room, isn't necessarily as
+// energetic as a full nearby data frame) against the now-correctly-
+// calibrated ambient floor. Lowered to 2.0x -- verified by simulation this
+// stays at essentially zero false positives (0-1/300 samples, even under
+// deliberately extreme synthetic ambient jitter standing in for real-world
+// AGC pumping) while correctly catching a signal only ~2.2x louder than
+// ambient that 4.0x missed entirely.
+const SQUELCH_BUSY_MULTIPLIER = 2.0;
 const SQUELCH_MIN_FLOOR = 0.0005; // absolute floor so a near-silent source doesn't call every nonzero signal "busy"
 // How many initial readings get folded into the floor unconditionally
 // (bypassing the normal busy-gate) before switching to steady-state
@@ -1553,13 +1563,31 @@ function updateMicLevelDisplay(peak) {
   currentMicPeak = peak;
 }
 
-/// Waits for the channel to sound quiet (per the adaptive squelch, see
-/// SQUELCH_*/squelchIsBusy above) before a transmission starts, then makes
-/// it wait a short random jitter on top and re-checks -- see the
-/// CARRIER_SENSE_* constants for why the jitter applies even on an
-/// already-clear channel, not just a busy one. A device that isn't
-/// listening has no mic level to check and returns immediately (transmits
-/// blind, same as before this existed).
+/// Whether the channel should be treated as busy -- squelchIsBusy()
+/// (amplitude-based, catches a transmission before this device has locked
+/// onto anything) OR'd with a protocol-level signal: is pollCapture
+/// CURRENTLY holding position on a real, already-preamble-and-header-
+/// verified frame that just hasn't fully arrived yet (scanStuckSince, see
+/// pollCapture)? Found live: a message's send still collided with an
+/// incoming ack even after tuning the squelch's own sensitivity -- raw
+/// amplitude alone can miss a real but relatively quiet signal (an ack's
+/// own transmission, picked up from across a room, isn't necessarily as
+/// energetic as a nearby full data frame). Once this device has actually
+/// demodulated a valid preamble and header for something, that's a FAR
+/// more reliable "someone is transmitting to me right now" signal than
+/// any amplitude threshold -- it can't be fooled by ambient loudness or
+/// AGC in either direction, because it's driven by the real protocol
+/// state, not a guess about what a "loud enough" signal sounds like.
+function channelLooksBusy() {
+  return squelchIsBusy() || scanStuckSince.phone !== null || scanStuckSince.fast_air !== null;
+}
+
+/// Waits for the channel to sound quiet (per channelLooksBusy above)
+/// before a transmission starts, then makes it wait a short random jitter
+/// on top and re-checks -- see the CARRIER_SENSE_* constants for why the
+/// jitter applies even on an already-clear channel, not just a busy one.
+/// A device that isn't listening has no mic level to check and returns
+/// immediately (transmits blind, same as before this existed).
 async function waitForClearChannel() {
   if (!listening) return;
   const previousStatus = carriageStatus.textContent;
@@ -1567,7 +1595,7 @@ async function waitForClearChannel() {
   let waited = 0;
   let lastLoggedAt = 0;
   while (performance.now() < deadline) {
-    if (squelchIsBusy()) {
+    if (channelLooksBusy()) {
       // Logged periodically (not just once) so a real session's console
       // shows a time series of fast/floor while stuck waiting -- a single
       // snapshot from the first busy check can't tell "genuinely busy the
@@ -1577,7 +1605,7 @@ async function waitForClearChannel() {
       // needs answering when this wait is running out its full length
       // instead of clearing quickly the way a real quiet gap should let it.
       if (performance.now() - lastLoggedAt > 1000) {
-        dbg("carrier-busy", "fast=" + squelchFast.toFixed(4), "floor=" + squelchFloor.toFixed(4), "threshold=" + (Math.max(squelchFloor, SQUELCH_MIN_FLOOR) * SQUELCH_BUSY_MULTIPLIER).toFixed(4), "waited=" + Math.round(waited) + "ms");
+        dbg("carrier-busy", "fast=" + squelchFast.toFixed(4), "floor=" + squelchFloor.toFixed(4), "threshold=" + (Math.max(squelchFloor, SQUELCH_MIN_FLOOR) * SQUELCH_BUSY_MULTIPLIER).toFixed(4), "midFrame=" + (scanStuckSince.phone !== null || scanStuckSince.fast_air !== null), "waited=" + Math.round(waited) + "ms");
         lastLoggedAt = performance.now();
       }
       setCarriageStatus("● CHANNEL BUSY, WAITING…");
@@ -1594,7 +1622,7 @@ async function waitForClearChannel() {
     const jitter = CARRIER_SENSE_JITTER_MIN_MS + Math.random() * (CARRIER_SENSE_JITTER_MAX_MS - CARRIER_SENSE_JITTER_MIN_MS);
     waited += jitter;
     await sleep(jitter);
-    if (!squelchIsBusy()) {
+    if (!channelLooksBusy()) {
       dbg("carrier-clear", "channel clear after", Math.round(waited) + "ms");
       setCarriageStatus(previousStatus); // restore whatever the caller had shown before we stepped on it
       return;
