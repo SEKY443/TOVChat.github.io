@@ -317,6 +317,21 @@ typewriter-key-styled controls.
     right in the UI, no console needed. A message acked on the very first
     try still shows the plain label; the count only appears once a resend
     actually happened.
+
+    **Requested live again**: also show how many acks a message actually
+    received, not just whether the first one arrived — meaningful under
+    broadcast, since every listening receiver that got the message sends
+    its own ack, so this is a direct, live count of how many receivers
+    actually heard it. `markDelivered` used to stop tracking an id
+    entirely the moment the first ack landed (deleting its
+    `pendingDeliveries` entry) — a second or third receiver's ack for the
+    same message was silently dropped, counted nowhere. It now looks the
+    message up in history directly instead of only in `pendingDeliveries`,
+    so it keeps counting acks even after delivery, no retry cycle left to
+    cancel or not — `✓ DELIVERED (3 ACKS)`, live-updating in the UI as
+    each one arrives. Both counts combine when both apply — `✓ DELIVERED
+    (2 RESENDS, 3 ACKS)` — and neither shows at all for the ordinary case
+    (one receiver, acked on the first try).
 - **Ack redesign**: the delivery-confirmation ack used to be its own
   binary wire frame (`AckFrame`, mirroring `NackFrame`'s RS-protected
   5-byte header) — but checking the actual CLI-TextOverVoice reference

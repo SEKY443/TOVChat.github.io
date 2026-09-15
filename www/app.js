@@ -735,13 +735,22 @@ function statusLabel(entry) {
         return "AWAITING ACK";
       case "resending":
         return `RESENDING (${entry.attempt}/${maxRetries})`;
-      case "delivered":
-        // deliveredAfterAttempts is only set once markDelivered actually
-        // ran (see there) -- 0 means the very first send got acked, no
-        // resend needed, so the plain label covers that case too.
-        return entry.deliveredAfterAttempts
-          ? `✓ DELIVERED (${entry.deliveredAfterAttempts} RESEND${entry.deliveredAfterAttempts === 1 ? "" : "S"})`
-          : "✓ DELIVERED";
+      case "delivered": {
+        // deliveredAfterAttempts/ackCount are only set once markDelivered
+        // actually ran (see there) -- 0 resends and exactly 1 ack (the
+        // ordinary case: one receiver, acked on the first try) means
+        // there's nothing extra worth calling out, so the plain label
+        // covers that case too. ackCount can keep growing after delivery
+        // as more receivers' acks arrive (broadcast, no addressing) --
+        // this re-renders live each time, same as the resend count does
+        // while a message is still in flight.
+        const parts = [];
+        if (entry.deliveredAfterAttempts) {
+          parts.push(`${entry.deliveredAfterAttempts} RESEND${entry.deliveredAfterAttempts === 1 ? "" : "S"}`);
+        }
+        if (entry.ackCount > 1) parts.push(`${entry.ackCount} ACKS`);
+        return parts.length ? `✓ DELIVERED (${parts.join(", ")})` : "✓ DELIVERED";
+      }
       case "undelivered":
         return "✕ UNDELIVERED";
       default:
@@ -1109,19 +1118,40 @@ async function attemptDeliveryRetry(id) {
 }
 
 /// Called when an ack for `id` is heard -- cancels any pending retry and
-/// marks the message delivered. A no-op if `id` isn't a message this
-/// device is currently tracking (an ack for someone else's message, or one
-/// already resolved).
+/// marks the message delivered, or (if already delivered) just counts
+/// this as one more ack heard for it. A no-op if `id` isn't a message
+/// this device ever sent (an ack for someone else's message).
+///
+/// Requested live: show how many acks a message actually received, not
+/// just whether the first one arrived. Meaningful under broadcast --
+/// every listening receiver that got the message sends its own ack, so
+/// this is a direct, live count of how many receivers actually heard it,
+/// not merely "at least one did." Counting continues even after the
+/// message is marked delivered (there's no more retry cycle to cancel at
+/// that point, but a second, third, ... receiver's ack is still real
+/// information worth showing) -- see statusLabel for how it's displayed.
 function markDelivered(id) {
+  const entry = history.find((h) => h.id === id && h.dir === "tx");
+  if (!entry) return; // an ack for a message this device never sent
+  const ackCount = (entry.ackCount ?? 0) + 1;
+
   const pending = pendingDeliveries.get(id);
-  if (!pending) return;
-  dbg("delivered", id, `after ${pending.attempt} resend(s)`);
-  clearTimeout(pending.timer);
-  pendingDeliveries.delete(id);
-  // Carried into the history entry (see statusLabel) so the resend count
-  // is visible in the UI itself, not just this console line -- the
-  // pendingDeliveries entry it lives on is about to be deleted.
-  updateHistoryEntry(id, "tx", { status: "delivered", deliveredAfterAttempts: pending.attempt });
+  if (pending) {
+    dbg("delivered", id, `after ${pending.attempt} resend(s)`, `ack #${ackCount}`);
+    clearTimeout(pending.timer);
+    pendingDeliveries.delete(id);
+    // deliveredAfterAttempts carried into the history entry (see
+    // statusLabel) so it's visible in the UI itself, not just this
+    // console line -- the pendingDeliveries entry it lives on is about
+    // to be deleted.
+    updateHistoryEntry(id, "tx", { status: "delivered", deliveredAfterAttempts: pending.attempt, ackCount });
+  } else {
+    // Already delivered earlier -- an extra ack from another receiver (or
+    // a resend's ack arriving after the fact). No retry cycle left to
+    // cancel, but still worth counting and showing.
+    dbg("ack-extra", id, `ack #${ackCount}`);
+    updateHistoryEntry(id, "tx", { ackCount });
+  }
 }
 
 /// User-initiated cancel of an in-progress auto-retry cycle (see the STOP
