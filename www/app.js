@@ -1020,6 +1020,23 @@ async function sendMessage() {
   }
 }
 
+/// How long to wait for an ack before treating it as lost, scaled by how
+/// many messages THIS device currently has simultaneously awaiting one.
+/// Found live: sending several messages in quick succession left one of
+/// them UNDELIVERED even though the receiver's own console proved it had
+/// genuinely decoded and acked every single one -- just later than any
+/// one message's fixed grace period allowed for. Every pending message
+/// shares this device's own serialized playPcm queue for its resends, so
+/// a bigger backlog genuinely takes proportionally longer to work
+/// through even when nothing is actually lost -- a false "undelivered"
+/// caused by a real, self-created backlog, not a real loss. Scaling the
+/// wait by that backlog directly addresses it without loosening the
+/// budget for the common case: a single message in flight still gets
+/// exactly the base grace period.
+function currentDeliveryGraceMs() {
+  return RETRY_ACK_GRACE_MS * Math.max(1, pendingDeliveries.size);
+}
+
 /// Schedules the next auto-resend check for `id` -- called once right
 /// after the initial send, then again after every retry attempt. Does
 /// nothing if `id` isn't (or is no longer) pending, so a stray call after
@@ -1027,7 +1044,8 @@ async function sendMessage() {
 function scheduleDeliveryRetry(id) {
   const pending = pendingDeliveries.get(id);
   if (!pending) return;
-  pending.timer = setTimeout(() => attemptDeliveryRetry(id), RETRY_ACK_GRACE_MS);
+  const graceMs = currentDeliveryGraceMs();
+  pending.timer = setTimeout(() => attemptDeliveryRetry(id), graceMs);
 }
 
 async function attemptDeliveryRetry(id) {
@@ -1042,7 +1060,7 @@ async function attemptDeliveryRetry(id) {
   }
 
   pending.attempt += 1;
-  dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", RETRY_ACK_GRACE_MS + "ms");
+  dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", currentDeliveryGraceMs() + "ms", "(" + pendingDeliveries.size + " pending)");
   updateHistoryEntry(id, "tx", { status: "resending", attempt: pending.attempt });
   try {
     const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined);

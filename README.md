@@ -529,6 +529,25 @@ typewriter-key-styled controls.
     side's own contention jitter, so a reply gets a real listening window,
     not just a technically-permitted instant to transmit into.
 
+    **Found live, re-testing the same three-message burst after the fix
+    above**: real improvement (zero of three delivered before, two of
+    three after) but still not all three — the receiver's own history
+    proved the third one WAS genuinely received and acked, just ~55
+    seconds after it was sent, well past that message's own fixed 3-
+    attempt/14s-per-attempt budget (42s total) already having given up.
+    Every pending message shares this device's own serialized `playPcm`
+    queue for its resends, so a bigger backlog of simultaneously-pending
+    messages genuinely takes proportionally longer to work through even
+    when nothing is actually lost — a false "undelivered" caused by a
+    real, self-created backlog, not a real loss. `currentDeliveryGraceMs`
+    now scales the wait by how many messages this device currently has
+    simultaneously awaiting an ack (`RETRY_ACK_GRACE_MS *
+    pendingDeliveries.size`), recomputed fresh each time a retry is
+    scheduled so it adapts as the backlog grows or shrinks — a single
+    message in flight still gets exactly the base grace period; three
+    give each one roughly triple the patience, matching how much longer
+    the shared channel genuinely needs.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
