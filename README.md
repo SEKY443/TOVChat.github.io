@@ -625,6 +625,21 @@ typewriter-key-styled controls.
     remains the tool for finding whether a specific real channel actually
     needs more than the default.
 
+    **Requested live, right after**: sitting on `● RECEIVING…` for up to
+    130 seconds before the stall watchdog recovered it read as stuck, not
+    patient. That value was calibrated specifically against a real gap
+    measured in PHONE mode (`symbol_duration_s` 0.04s/symbol — see
+    modem.rs). FAST_AIR runs its symbols at half that (0.02s/symbol), so
+    the same kind of legitimately-still-arriving gap that genuinely took
+    phone mode 20+ seconds has no comparable excuse to take fast_air
+    anywhere near as long — a fast_air stall is much more likely to mean
+    "this attempt is dead." `LIVE_DECODE_STALL_TIMEOUT_MS` is now
+    per-mode (`{ phone: 130000, fast_air: 25000 }`) instead of one shared
+    value, keyed by `liveDecodeMode` (already tracked — see the
+    same-tick dual-mode race fix above) — phone keeps the number actually
+    measured against a real slow-but-live transmission; fast_air recovers
+    roughly 5x faster.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history

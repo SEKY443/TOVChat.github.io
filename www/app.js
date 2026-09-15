@@ -156,7 +156,20 @@ const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
 // only ever clears once the underlying scan itself would already have
 // given up and reported a real failure -- never while a legitimately slow
 // transmission is still genuinely in progress.
-const LIVE_DECODE_STALL_TIMEOUT_MS = 130000;
+//
+// Requested live, right after: sitting on "RECEIVING" for up to 130
+// seconds before recovering read as stuck, not patient -- and that
+// 130000ms value was calibrated against a real gap measured specifically
+// in PHONE mode (symbol_duration_s 0.04s/symbol -- see modem.rs). FAST_AIR
+// runs its symbols at half that (0.02s/symbol), so the same genuinely-
+// still-arriving gap that legitimately took phone mode 20+ seconds has no
+// comparable excuse to take fast_air anywhere near as long -- a fast_air
+// stall really is much more likely to mean "this attempt is dead," and
+// waiting 130s to say so just because phone mode sometimes legitimately
+// needs that long was needlessly making fast_air feel broken. Split per
+// mode instead of one shared value; phone keeps the number that was
+// actually measured against a real slow-but-live transmission.
+const LIVE_DECODE_STALL_TIMEOUT_MS = { phone: 130000, fast_air: 25000 };
 const LIVE_DECODE_STALL_CHECK_MS = 2000;
 // Per-character flicker duration for newly-arrived (or newly-corrected)
 // live-preview text. Fixed and short -- unlike an earlier version of this
@@ -1531,8 +1544,9 @@ function ensureLiveDecodeTracking(id, username, mode) {
 /// stuck-forever scan, not a crashed one).
 function checkLiveDecodeStall() {
   if (liveDecodeEl.hidden || liveDecodeId === null || liveDecodeCompleted) return;
-  if (performance.now() - liveDecodeLastProgressAt < LIVE_DECODE_STALL_TIMEOUT_MS) return;
-  dbg("live-decode-stalled", liveDecodeId, "no progress for", LIVE_DECODE_STALL_TIMEOUT_MS + "ms");
+  const timeoutMs = LIVE_DECODE_STALL_TIMEOUT_MS[liveDecodeMode] ?? LIVE_DECODE_STALL_TIMEOUT_MS.phone;
+  if (performance.now() - liveDecodeLastProgressAt < timeoutMs) return;
+  dbg("live-decode-stalled", liveDecodeId, liveDecodeMode, "no progress for", timeoutMs + "ms");
   resetLiveDecode();
   flashLiveDecodeStatus("✕ SIGNAL LOST — AWAITING SIGNAL");
 }
