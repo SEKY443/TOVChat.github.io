@@ -443,6 +443,18 @@ let liveDecodeConfirmed = "";
 // shown for the frame still arriving. May differ from what eventually
 // gets confirmed -- see revealTo, which corrects it if so.
 let liveDecodeShown = "";
+// True once liveDecodeId's message has been confirmed complete (a real,
+// FEC/CRC-verified result.ok) at least once -- lets ensureLiveDecodeTracking
+// tell "still the same message still arriving" apart from "this id again,
+// but as a NEW transmission" (a resend, heard because the sender's ack
+// never arrived). Without this, a resend of the message the box is still
+// showing the "MESSAGE COMPLETE" hold for -- same id, so the old id check
+// alone treated it as a continuation -- got its text appended onto the
+// already-complete text instead of the box starting over, and since it's
+// a duplicate (see alreadyReceived) never got a fresh completion callback
+// either, so it stayed stuck showing that broken, doubled text
+// indefinitely instead of ever resetting again.
+let liveDecodeCompleted = false;
 let liveDecodeRevealToken = 0; // bumped to cancel an in-flight reveal when superseded
 let liveDecodeStatusRestoreTimer = null;
 
@@ -1091,6 +1103,7 @@ function resetLiveDecode() {
   liveDecodeUsername = "";
   liveDecodeConfirmed = "";
   liveDecodeShown = "";
+  liveDecodeCompleted = false;
   liveDecodeRevealToken++;
   liveDecodeTextEl.textContent = "";
   clearTimeout(liveDecodeStatusRestoreTimer);
@@ -1108,16 +1121,20 @@ function hideLiveDecode() {
 }
 
 /// Starts tracking a (possibly new) message in the live-decode box: resets
-/// confirmed/shown text and the on-screen element the moment `id` differs
-/// from whatever was previously showing. A no-op otherwise, so callers can
-/// call this unconditionally on every preview/confirmation without an
-/// `if (tag.id !== liveDecodeId)` check of their own.
+/// confirmed/shown text and the on-screen element whenever `id` differs
+/// from whatever was previously showing, OR the previously-showing id
+/// already completed once (see liveDecodeCompleted) -- a resend of the
+/// same message arriving is a NEW transmission event as far as the box is
+/// concerned, not a continuation of the one it already finished showing.
+/// A no-op otherwise, so callers can call this unconditionally on every
+/// preview/confirmation without checking either condition themselves.
 function ensureLiveDecodeTracking(id, username) {
-  if (id === liveDecodeId) return;
+  if (id === liveDecodeId && !liveDecodeCompleted) return;
   liveDecodeId = id;
   liveDecodeUsername = username;
   liveDecodeConfirmed = "";
   liveDecodeShown = "";
+  liveDecodeCompleted = false;
   liveDecodeTextEl.textContent = "";
 }
 
@@ -1236,9 +1253,12 @@ function handleDecodedFrame(frame, mode) {
   // A resend the sender only sent because it never heard our first ack
   // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
   // identical to a genuinely new message here -- same id, same content,
-  // decoded clean. Computed before revealTo so the "message complete"
-  // callback can be skipped for a duplicate the same way ringBell already
-  // is, below.
+  // decoded clean. Used below to skip ringBell/history-duplication for a
+  // duplicate -- but NOT to skip the live-decode box's own completion
+  // (see revealTo's onDone below): the box reflects what's actually being
+  // heard right now, and a resend really did just fully arrive again, so
+  // it announces "complete" and resets on its own schedule regardless of
+  // whether this is old news for the chat history.
   const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
 
   // Fold this frame's now-CONFIRMED (FEC/CRC-verified) text into the live
@@ -1249,7 +1269,8 @@ function handleDecodedFrame(frame, mode) {
     liveDecodeConfirmed += tag.text;
     clearTimeout(liveDecodeStatusRestoreTimer);
     setLiveDecodeStatus(steadyLiveDecodeStatus());
-    revealTo(liveDecodeConfirmed, result.ok && !alreadyReceived ? onLiveMessageComplete : undefined);
+    if (result.ok) liveDecodeCompleted = true;
+    revealTo(liveDecodeConfirmed, result.ok ? onLiveMessageComplete : undefined);
   }
 
   if (result.ok) {

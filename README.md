@@ -298,6 +298,25 @@ typewriter-key-styled controls.
   same `encode_frames_to_pcm`/`scan_next_frame` path an ordinary message
   uses. Shorter on the wire, less code, and consistent with how the
   reference implementation actually solves this.
+
+  **Found live: the readout could get stuck showing doubled text.**
+  `ensureLiveDecodeTracking` only reset the box's state when a frame's
+  message id differed from whatever it was already tracking — reasonable
+  for ordinary growth (a multi-frame message's later frames share the
+  first frame's id on purpose), but wrong for a *resend*: if the sender's
+  ack was lost and it resent the same message while the receiver's box
+  was still in its post-completion hold (showing "MESSAGE COMPLETE" for
+  that same id), the id check saw no difference and treated the resend as
+  a continuation — appending its text onto the already-complete text
+  instead of starting over. Worse, because a resend is a duplicate for
+  chat-history purposes, the box's own completion callback used to be
+  skipped for it too, so nothing ever rescheduled the reset — the box
+  stayed stuck on that doubled text until some unrelated later message
+  came along. Now the box tracks whether its current id already completed
+  once, and treats a same-id arrival after that as a new transmission
+  event (reset first, then fill in) — while the live box's own
+  complete/reset cycle always runs on a real confirmed result, whether or
+  not that result happens to be a duplicate for the chat history.
 - **Resend**, three ways:
   - A sent message always gets a local one-click resend (replays from
     its stored chunks/settings, no audio round trip needed).
