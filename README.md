@@ -665,14 +665,22 @@ typewriter-key-styled controls.
   above 0xFF for anything wider, so a CJK character's "decode" flickered
   through a value with no relationship to the character at all. Now it
   encodes the character to its real UTF-8 bytes and, for anything wider
-  than one byte, shows the actual hex bytes joined by `-` (the same role
-  UTF-8's own continuation-byte marker plays) and capped with `×` once
-  the sequence for that character is complete — e.g. 漢 flickers through
-  `E6-BC-A2×` before resolving. ASCII is unchanged (still 8-bit binary).
+  than one byte, shows them joined by `-` (the same role UTF-8's own
+  continuation-byte marker plays) and capped with `×` once the sequence
+  for that character is complete. ASCII is unchanged (still 8-bit binary).
   Still not a literal reconstruction of this app's actual wire bytes
   (those depend on charset/dictionary compression this layer doesn't have
   visibility into) — but now an honest encoding of the character itself
   instead of a value with no meaning.
+
+  **Requested live**: show binary throughout, not hex for the multi-byte
+  case — the same 8-bit-per-byte shape the single-byte (ASCII) path
+  already used, so the flicker reads as one consistent decode process
+  regardless of how many bytes a character takes, with the actual
+  bit-level shape of UTF-8 genuinely visible (a lead byte's `1110xxxx`/
+  `11110xxx` marker, each continuation byte's `10xxxxxx` marker) instead
+  of abbreviated away into hex digits. 漢 now flickers through
+  `11100110-10111100-10100010×` before resolving, instead of `E6-BC-A2×`.
 
 - **Self-hearing, found live**: a device with LISTEN on while it also
   sends — completely normal single-device usage, not just the two-tab

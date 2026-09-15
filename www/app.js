@@ -642,39 +642,52 @@ function renderEntry(entry) {
 
 const utf8Encoder = new TextEncoder();
 
-/// The character's real encoded bytes -- for a single-byte (ASCII/Latin-1)
-/// character, its 8-bit binary, same as before. For anything wider (CJK,
-/// emoji, accented characters outside Latin-1 -- multiple UTF-8 bytes per
-/// character), `ch.codePointAt(0) & 0xff` used to silently discard every
-/// bit above the low byte, showing a meaningless flicker for exactly the
-/// characters where "watch it decode" mattered most -- found live sending
-/// Chinese text, where the box never showed anything resembling a real
-/// decode step. Now it shows the character's actual UTF-8 bytes in hex,
-/// joined by "-" (marking a continuation byte, same idea as UTF-8's own
-/// 10xxxxxx continuation-byte marker) and capped with "×" as the
-/// terminator once the full sequence for this one character is shown.
-/// Still not a literal reconstruction of this app's actual wire bytes
-/// (which depend on charset/dictionary compression this layer doesn't
-/// have visibility into) -- but now at least an honest, real encoding of
-/// the character itself, not a value with no meaning at all.
+function randomBinaryByte() {
+  return Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
+}
+
+/// The character's real encoded bytes, each shown as 8-bit binary -- for
+/// a single-byte (ASCII/Latin-1) character, just that one byte, same as
+/// before. For anything wider (CJK, emoji, accented characters outside
+/// Latin-1 -- multiple UTF-8 bytes per character), `ch.codePointAt(0) &
+/// 0xff` used to silently discard every bit above the low byte, showing a
+/// meaningless flicker for exactly the characters where "watch it decode"
+/// mattered most -- found live sending Chinese text, where the box never
+/// showed anything resembling a real decode step. Now it shows the
+/// character's actual UTF-8 bytes, joined by "-" (marking a continuation
+/// byte, the same role UTF-8's own 10xxxxxx continuation-byte marker
+/// plays) and capped with "×" as the terminator once the full sequence
+/// for this one character is shown.
+///
+/// Requested live: show binary throughout, not hex for the multi-byte
+/// case -- the same 8-bit-per-byte shape the single-byte path already
+/// uses, so the flicker reads as one consistent decode process regardless
+/// of how many bytes a character takes, and the actual bit-level shape of
+/// UTF-8 (a lead byte's 1110xxxx/etc. marker, each continuation byte's
+/// 10xxxxxx marker) is genuinely visible instead of abbreviated away into
+/// hex. E.g. 漢 -> 11100110-10111100-10100010×. Still not a literal
+/// reconstruction of this app's actual wire bytes (which depend on
+/// charset/dictionary compression this layer doesn't have visibility
+/// into) -- but an honest, real encoding of the character itself, not a
+/// value with no meaning at all.
 function charBits(ch) {
   const bytes = utf8Encoder.encode(ch);
   if (bytes.length === 1) {
     return bytes[0].toString(2).padStart(8, "0");
   }
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join("-") + "×";
+  return Array.from(bytes, (b) => b.toString(2).padStart(8, "0")).join("-") + "×";
 }
 
 /// A scrambled guess in the same shape charBits(ch) would resolve to --
-/// same byte count, same hex/binary formatting -- so the flicker settles
-/// from "plausible-looking guess" to "real bytes" without the shape
-/// itself jumping partway through.
+/// same byte count, same binary formatting, same "-"/"×" connector and
+/// terminator -- so the flicker settles from "plausible-looking guess" to
+/// "real bytes" without the shape itself jumping partway through.
 function scrambledBits(ch) {
   const byteCount = utf8Encoder.encode(ch).length;
   if (byteCount === 1) {
-    return Array.from({ length: 8 }, () => (Math.random() < 0.5 ? "0" : "1")).join("");
+    return randomBinaryByte();
   }
-  return Array.from({ length: byteCount }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0").toUpperCase()).join("-") + "×";
+  return Array.from({ length: byteCount }, randomBinaryByte).join("-") + "×";
 }
 
 /// Reveals one more character onto `prefix` via `setText` (a callback
