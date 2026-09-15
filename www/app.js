@@ -702,7 +702,15 @@ function scrambledBits(ch) {
 /// gracefully: skip the scrambled-guess phase first, then skip straight
 /// to the resolved character -- staying fast and legible instead of
 /// stretching the animation past what the budget actually allows.
-async function flickerInChar(setText, prefix, ch, budgetMs) {
+async function flickerInChar(setText, prefix, ch, budgetMs, isCurrent) {
+  // isCurrent is polled before every setText/sleep pair -- found live: a
+  // caller (revealTo) that only checks its cancellation token BEFORE
+  // starting this function left this function free to keep calling
+  // setText for its own remaining ~budgetMs once superseded, racing its
+  // stale writes against the newer call's writes to the same element.
+  // Bailing out here, mid-character, the instant we're superseded closes
+  // that race instead of just narrowing it.
+  if (!isCurrent()) return;
   if (ch.trim() === "") {
     setText(prefix + ch);
     await sleep(Math.min(budgetMs, TYPEWRITER_CHAR_MS));
@@ -716,14 +724,17 @@ async function flickerInChar(setText, prefix, ch, budgetMs) {
   if (budgetMs < FLICKER_BITS_ONLY_THRESHOLD_MS) {
     setText(prefix + charBits(ch));
     await sleep(budgetMs * 0.5);
+    if (!isCurrent()) return;
     setText(prefix + ch);
     await sleep(budgetMs * 0.5);
     return;
   }
   setText(prefix + scrambledBits(ch));
   await sleep(budgetMs * 0.3);
+  if (!isCurrent()) return;
   setText(prefix + charBits(ch));
   await sleep(budgetMs * 0.3);
+  if (!isCurrent()) return;
   setText(prefix + ch);
   await sleep(budgetMs * 0.4);
 }
@@ -1412,8 +1423,13 @@ async function revealTo(targetText, onDone) {
       (t) => { liveDecodeTextEl.textContent = t; },
       targetText.slice(0, i),
       targetText[i],
-      LIVE_PREVIEW_CHAR_MS
+      LIVE_PREVIEW_CHAR_MS,
+      () => token === liveDecodeRevealToken
     );
+    if (token !== liveDecodeRevealToken) {
+      dbg("reveal-superseded", "token=" + token, "mid-char at", i, "of", targetText.length);
+      return;
+    }
     // Committed incrementally, not just once at the very end -- found
     // live: a newer reveal (the next poll's preview update, still a
     // genuine forward extension per updateLivePreview's own check) can

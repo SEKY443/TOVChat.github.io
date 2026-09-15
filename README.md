@@ -350,6 +350,37 @@ typewriter-key-styled controls.
     not just once at the end, so any interrupting reveal always sees
     precisely how far its predecessor actually got.
 
+    **Still happened a third time, confirmed live with a corrected test
+    methodology**: the incremental-commit fix above was itself necessary
+    but not sufficient — the first attempt to verify it used an automated
+    check that filtered the observed DOM snapshots down to a "settled"
+    subset before looking for regressions, which filtered out exactly the
+    intermediate flicker frames the bug lived in, and falsely reported the
+    fix as confirmed. Re-run against the full, unfiltered snapshot log,
+    the regression was still there. The actual remaining bug: `revealTo`
+    only checked its cancellation token *before* starting `flickerInChar`
+    for a character, not during it. `flickerInChar` itself runs several
+    `await sleep(...)` phases (scrambled guess → real bits → resolved
+    letter) interspersed with direct `setText` calls, all *inside* a
+    single `await` from `revealTo`'s point of view — so once a newer
+    reveal bumped the token while an older call's `flickerInChar` was
+    mid-phase, the older call had no way to notice and kept calling
+    `setText` with its own (now stale) scrambled/partial content for the
+    rest of that character's ~40ms budget, directly racing its writes
+    against the newer call's writes to the same `textContent`. Two
+    reveals painting the same element in the same tick is what actually
+    looked like "restarting from the middle." Fixed by threading an
+    `isCurrent()` check into `flickerInChar` itself, polled before every
+    `setText` call after the first (the only one with no prior `await`,
+    so no race is possible there) — an interrupted character now stops
+    writing the instant it's superseded, instead of finishing out its
+    budget on stale data. `revealTo` also now bails immediately if
+    `flickerInChar` returns having been superseded mid-character, instead
+    of committing a half-finished character into `liveDecodeShown`.
+    Verified by re-running the same live test a third time and this time
+    checking the *entire* raw snapshot log's resolved-prefix length for
+    monotonic growth, not a filtered subset.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
