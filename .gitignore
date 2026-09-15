@@ -2,3 +2,4 @@
 /www/pkg
 node_modules/
 .DS_Store
+/NEXT_AGENT_WEB_PROMPT.md
