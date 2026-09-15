@@ -634,6 +634,40 @@ v1 deliberately does not include: addressing/contacts UI, encryption key
 exchange UX. Broadcast + unencrypted only for now — the username envelope
 is the "who's this from" mechanism in the meantime.
 
+## Performance
+
+**Found live: severely poor performance on a real phone.** Every per-poll
+wasm call while listening (`preview_frame` and `scan_next_frame` — once
+each per mode — plus `scan_for_nack`) does work that scales with the
+captured buffer's sample count, and the whole capture pipeline was running
+at the browser's native `AudioContext` rate — 44100 or 48000Hz on
+virtually every real device. Every modem tone this protocol uses lives
+inside the 300–3400Hz telephone voice band (see
+[`textovervoice-core`](https://github.com/SEKY443/textovervoice-core)'s
+`modem.rs`), and the wire format is itself designed natively around
+8000Hz (`modem::SR`) — capturing at native rate was processing 3–6x more
+samples than the signal has any real content in, multiplying every one of
+those costs for zero benefit. A much bigger hit on a phone's weaker CPU
+than it ever looked like on a desktop testing it. Now requests the
+context at 16000Hz — not 8000Hz (`modem::SR`) exactly, to keep a
+comfortable 2x safety margin above the highest tone (8000Hz Nyquist vs. a
+3400Hz ceiling), since a real anti-aliasing filter isn't perfectly
+brick-wall and this is capture, not the wire format itself. Playback is
+unaffected — `playPcm` already builds its buffer at the modem's own SR
+(8000) explicitly, and Web Audio resamples on output regardless of what
+rate the context runs at.
+
+On top of that, two per-poll costs that don't need to run on literally
+every single poll to still feel responsive are now throttled: the
+real-time preview (`updateLivePreview`, which redoes the full demodulation
+`scan_next_frame` is about to redo again right after it) to every 2nd
+poll, and the NACK scan (`scan_for_nack`, which rescans the *entire*
+buffer every time it runs, not just the unscanned tail — a rare,
+user-initiated request, not the hot path) to every 3rd poll. The frame-
+completion scan itself (`scan_next_frame`'s own loop) is untouched and
+still runs every poll — throttling the thing actual message latency and
+reliability depend on wasn't on the table.
+
 ## What's next
 
 1. **Validate a real microphone/speaker acoustic round trip** — grant mic

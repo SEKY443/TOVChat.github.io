@@ -803,9 +803,36 @@ exportDataBtn.addEventListener("click", exportData);
 
 // ============================= audio context =============================
 
+// Found live: severely poor performance on a real phone. Every per-poll
+// wasm call (preview_frame, scan_next_frame -- twice, once per mode --
+// scan_for_nack, plus normalizePeak) does work that scales with the
+// captured buffer's SAMPLE COUNT, and this context (and the capture
+// pipeline built on it) was running at the browser's native rate --
+// 44100 or 48000Hz on virtually every real device -- for no reason: every
+// modem tone this protocol uses lives inside the 300-3400Hz telephone
+// voice band (see textovervoice-core's modem.rs -- PREAMBLE_F1 and every
+// data tone), and the wire format is itself designed natively around
+// 8000Hz (`modem::SR`). Capturing at native rate was processing 3-6x more
+// samples than the signal has any real content in, multiplying every one
+// of those per-poll costs for zero benefit -- a much bigger and more
+// direct hit on a phone's weaker CPU than on a desktop's. Requesting this
+// rate up front makes the whole capture pipeline (the worklet, the
+// buffer, every wasm call fed from it) operate on that many fewer samples
+// from the start; `captureSampleRate = ctx.sampleRate` downstream already
+// reads back whatever the browser actually grants, so this degrades
+// safely on a browser that won't honor the exact request. 16000, not
+// 8000 (`modem::SR`) exactly, to keep a comfortable 2x safety margin
+// above the highest tone (8000Hz Nyquist vs. a 3400Hz ceiling) -- a real
+// anti-aliasing filter isn't perfectly brick-wall, and this is capture,
+// not the wire format itself, so there's no reason to cut it close.
+// Playback is unaffected: `playPcm` already builds its buffer at the
+// modem's own SR (8000) explicitly and Web Audio resamples on output
+// regardless of what rate this context runs at.
+const CAPTURE_TARGET_SAMPLE_RATE = 16000;
+
 async function ensureAudioContext() {
   if (!audioCtx) {
-    audioCtx = new AudioContext();
+    audioCtx = new AudioContext({ sampleRate: CAPTURE_TARGET_SAMPLE_RATE });
   }
   if (audioCtx.state === "suspended") {
     await audioCtx.resume();
@@ -1424,12 +1451,24 @@ async function handleNackFound(info) {
   if (entry) await resendOwnMessage(targetId);
 }
 
+// Both throttle counters below exist for the same reason: found live,
+// severely poor performance on a real phone. `updateLivePreview` and
+// `scan_for_nack` each redo a full preamble search (`preview_frame` also
+// redoes the full demodulation `scan_next_frame` is about to do again
+// right after it, and `scan_for_nack` rescans the ENTIRE buffer, not just
+// the unscanned tail) -- real, necessary costs, but ones that don't need
+// to run on literally every single poll to still feel responsive.
+let pollCount = 0;
+const LIVE_PREVIEW_EVERY_N_POLLS = 2; // ~2.4s cadence -- still reads as "live," half the preview_frame calls
+const NACK_SCAN_EVERY_N_POLLS = 3; // ~3.6s -- a NACK is a rare, user-initiated request, not the hot path
+
 async function pollCapture(buffer) {
+  pollCount++;
   for (const mode of LISTEN_MODES) {
     // Real-time decode preview: shows whatever's demodulated so far at the
     // CURRENT scan position, independent of whether a frame below actually
     // finishes arriving this poll -- see updateLivePreview.
-    updateLivePreview(mode);
+    if (pollCount % LIVE_PREVIEW_EVERY_N_POLLS === 0) updateLivePreview(mode);
 
     let pos = scanPos[mode];
     while (true) {
@@ -1465,10 +1504,11 @@ async function pollCapture(buffer) {
     scanPos[mode] = pos;
 
     // scan_for_nack has no position to resume from -- it re-scans the whole
-    // buffer every poll, so a NACK sitting in it would otherwise be found
-    // (and acted on) again on every subsequent poll until the buffer moves
-    // past it. Wipe the buffer immediately after handling one, rather than
-    // tracking yet another per-mode cursor just for this.
+    // buffer every time it runs, so a NACK sitting in it would otherwise be
+    // found (and acted on) again on every subsequent poll until the buffer
+    // moves past it. Wipe the buffer immediately after handling one, rather
+    // than tracking yet another per-mode cursor just for this.
+    if (pollCount % NACK_SCAN_EVERY_N_POLLS !== 0) continue;
     let nack;
     try {
       nack = scan_for_nack(buffer, captureSampleRate, mode);
