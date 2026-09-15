@@ -1556,12 +1556,27 @@ function updateLivePreview(mode) {
   // noise most recently guessed. A genuinely new message still starts
   // tracking freely (nothing shown yet, or the previous one completed);
   // only a different id trying to steal an in-progress, not-yet-completed
-  // one that has already shown real content is refused here. The
-  // authoritative path, handleDecodedFrame, is untouched by this and
-  // always wins once a frame actually confirms (FEC/CRC-verified), so a
-  // bogus preview can only ever delay the real message's preview, never
-  // replace its eventual confirmed content.
-  if (liveDecodeId !== null && tag.id !== liveDecodeId && !liveDecodeCompleted && liveDecodeShown.length > 0) {
+  // one is refused here.
+  //
+  // Originally gated on `liveDecodeShown.length > 0` too (only protect a
+  // message that had already shown SOMETHING) -- found live, still
+  // racing: that left a gap for the very FIRST character, which is
+  // revealed asynchronously by flickerInChar over several `await`s before
+  // `liveDecodeShown` ever commits its first value (see revealTo). A
+  // competing mode's noise arriving inside that window saw an empty
+  // liveDecodeShown, read as "nothing shown yet," and evicted the real
+  // message before it ever got to show its own first character --
+  // confirmed live, char 0 alone racing 3 times before the real signal
+  // won out and the rest of the message revealed cleanly. Tracking starts
+  // the instant `ensureLiveDecodeTracking` runs below, not the instant
+  // something becomes visible, so the guard now has to key off the same
+  // thing: any id, tracked and not yet completed, is protected from here
+  // on, whether or not a character has resolved yet. The authoritative
+  // path, handleDecodedFrame, is untouched by this and always wins once a
+  // frame actually confirms (FEC/CRC-verified), so a bogus preview can
+  // only ever delay the real message's preview, never replace its
+  // eventual confirmed content.
+  if (liveDecodeId !== null && tag.id !== liveDecodeId && !liveDecodeCompleted) {
     return;
   }
 

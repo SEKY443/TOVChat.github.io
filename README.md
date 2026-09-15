@@ -403,14 +403,31 @@ typewriter-key-styled controls.
     reveals racing on the same id — it was the box being handed a
     different id entirely. Fixed in `updateLivePreview`: a different id is
     now refused from evicting an already-in-progress, not-yet-completed
-    tracked message that has already shown real content (`liveDecodeId !==
-    null && tag.id !== liveDecodeId && !liveDecodeCompleted &&
-    liveDecodeShown.length > 0`) — a genuinely new message still starts
-    tracking freely (nothing shown yet, or the previous one finished).
-    The authoritative path, `handleDecodedFrame`, is untouched by this
-    guard and always wins once a frame actually confirms (FEC/CRC-
-    verified), so a bogus preview can only ever delay the real message's
-    preview, never replace its eventual confirmed content.
+    tracked message (`liveDecodeId !== null && tag.id !== liveDecodeId &&
+    !liveDecodeCompleted`) — a genuinely new message still starts tracking
+    freely (nothing tracked yet, or the previous one finished). The
+    authoritative path, `handleDecodedFrame`, is untouched by this guard
+    and always wins once a frame actually confirms (FEC/CRC-verified), so
+    a bogus preview can only ever delay the real message's preview, never
+    replace its eventual confirmed content.
+
+    **Still raced on char 0 specifically, confirmed live a fifth time.**
+    The guard above originally also required `liveDecodeShown.length > 0`
+    — only protect a message that had already shown *something* on
+    screen. That left a gap for the very first character: `flickerInChar`
+    reveals it asynchronously over several `await`s (scramble → real bits
+    → resolved letter) before `revealTo` ever commits `liveDecodeShown`'s
+    first value. A competing mode's noise arriving inside that window saw
+    an empty `liveDecodeShown`, read as "nothing shown yet, safe to take
+    over," and evicted the real message before it ever finished showing
+    its own first character. Confirmed live: char 0 alone raced 3 times
+    (each one a fresh scramble-bits restart) before the real signal won
+    out and the rest of the message revealed cleanly with no further
+    issue. Tracking actually starts the instant `ensureLiveDecodeTracking`
+    runs, not the instant something becomes visible, so the guard needed
+    to key off the same thing — dropped the `liveDecodeShown.length > 0`
+    clause entirely; any tracked, not-yet-completed id is now protected
+    from the moment tracking starts.
 
     While investigating this, also chased what looked like a fourth,
     much stranger bug — the same message id showing up in `[TOV:send]`
