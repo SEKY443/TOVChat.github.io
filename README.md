@@ -508,6 +508,27 @@ typewriter-key-styled controls.
        AGC in either direction, because it's driven by real protocol
        state, not a guess about what counts as "loud enough."
 
+    **Found live, sending three messages in quick succession**: all three
+    ended up UNDELIVERED — but the receiver's own console showed it had
+    genuinely decoded and re-acked every one of them, with clean, short
+    carrier-clear waits each time. The sender's log showed zero `ack-recv`,
+    ever. Root cause wasn't carrier sense at all: three messages in flight
+    means the sender's own `playPcm` queue fills with the original sends
+    plus every retry — a dozen-plus of its OWN transmissions, one right
+    after another with nothing but the random contention jitter between
+    them. That leaves almost no window where the sender is both quiet
+    *and* actually listening: the instant one of its own clips ends, the
+    next queued one is already winding up to start (re-arming
+    `suppressCaptureUntil` the moment it does), so a reply arriving in that
+    narrow gap has a good chance of landing right as the sender keys up
+    again — swallowed by its own capture suppression, never actually lost
+    to the receiver's carrier sense. Fixed with a deliberate
+    `POST_TRANSMISSION_LISTEN_GAP_MS` (2s) pause after every one of a
+    device's own clips, before its own next queued transmission is allowed
+    to start — sized past a full poll cycle plus decode time and the other
+    side's own contention jitter, so a reply gets a real listening window,
+    not just a technically-permitted instant to transmit into.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.

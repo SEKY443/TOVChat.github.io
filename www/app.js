@@ -891,6 +891,28 @@ const CAPTURE_SUPPRESS_TAIL_S = 0.4;
 // inside the queue) exists to avoid colliding with.
 let playbackQueue = Promise.resolve();
 
+// Found live: sending three messages in quick succession left all three
+// UNDELIVERED even though the receiver genuinely decoded and re-acked
+// every one of them (confirmed in its own console log -- ack-sent fired
+// each time, with clean, short carrier-clear waits). The SENDER's own log
+// showed zero ack-recv, ever. Root cause: three messages in flight means
+// this device's own playbackQueue fills with the original sends plus every
+// retry -- a dozen-plus of this device's OWN transmissions, one right
+// after another with nothing but the random contention jitter between
+// them. That leaves almost no real gap where this device is both quiet
+// AND actually listening: the moment one of its own clips ends, the next
+// queued one is already winding up to start (and re-arming
+// suppressCaptureUntil the instant it does), so a reply arriving in that
+// narrow window has a good chance of landing right as this device keys up
+// again -- swallowed by its own suppression, not lost to the other side's
+// carrier sense at all. A deliberate pause here, after every one of this
+// device's own clips and before the next queued one is allowed to start,
+// guarantees the other side a real listening window -- sized past a full
+// poll cycle plus decode and their own contention jitter, comfortably
+// enough time for a reply to actually get heard, not just technically
+// permitted to transmit.
+const POST_TRANSMISSION_LISTEN_GAP_MS = 2000;
+
 function playPcm(float32Samples, sampleRate) {
   const task = playbackQueue.then(() =>
     waitForClearChannel().then(() => ensureAudioContext()).then((ctx) => {
@@ -908,10 +930,15 @@ function playPcm(float32Samples, sampleRate) {
       });
     })
   );
-  // Keep the queue moving even if this clip's caller never awaits it (e.g.
-  // sendAckFor's fire-and-forget) or playback fails -- one bad clip
-  // shouldn't wedge every later send behind it forever.
-  playbackQueue = task.catch(() => {});
+  // The gap delays when this device's OWN next queued transmission is
+  // allowed to start, not what the caller of this playPcm call is
+  // awaiting -- `task` still resolves as soon as this clip's playback
+  // genuinely ends, so callers (status updates, the retry scheduler) see
+  // the same timing as before. Keep the queue moving even if this clip's
+  // caller never awaits it (e.g. sendAckFor's fire-and-forget) or
+  // playback fails -- one bad clip shouldn't wedge every later send
+  // behind it forever.
+  playbackQueue = task.then(() => sleep(POST_TRANSMISSION_LISTEN_GAP_MS)).catch(() => {});
   return task;
 }
 
