@@ -723,7 +723,12 @@ function statusLabel(entry) {
       case "resending":
         return `RESENDING (${entry.attempt}/${maxRetries})`;
       case "delivered":
-        return "✓ DELIVERED";
+        // deliveredAfterAttempts is only set once markDelivered actually
+        // ran (see there) -- 0 means the very first send got acked, no
+        // resend needed, so the plain label covers that case too.
+        return entry.deliveredAfterAttempts
+          ? `✓ DELIVERED (${entry.deliveredAfterAttempts} RESEND${entry.deliveredAfterAttempts === 1 ? "" : "S"})`
+          : "✓ DELIVERED";
       case "undelivered":
         return "✕ UNDELIVERED";
       default:
@@ -1100,7 +1105,10 @@ function markDelivered(id) {
   dbg("delivered", id, `after ${pending.attempt} resend(s)`);
   clearTimeout(pending.timer);
   pendingDeliveries.delete(id);
-  updateHistoryEntry(id, "tx", { status: "delivered" });
+  // Carried into the history entry (see statusLabel) so the resend count
+  // is visible in the UI itself, not just this console line -- the
+  // pendingDeliveries entry it lives on is about to be deleted.
+  updateHistoryEntry(id, "tx", { status: "delivered", deliveredAfterAttempts: pending.attempt });
 }
 
 /// User-initiated cancel of an in-progress auto-retry cycle (see the STOP

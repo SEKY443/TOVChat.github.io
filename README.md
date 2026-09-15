@@ -308,6 +308,15 @@ typewriter-key-styled controls.
     itself is sent immediately either way; delaying delivery confirmation
     to match a multi-second reveal would only hurt real latency for no
     benefit to the sender.
+
+    **Requested live**: the resend count behind a `✓ DELIVERED` was only
+    ever visible in the debug console (`[TOV:delivered] id after N
+    resend(s)`). `markDelivered` now carries that count into the history
+    entry itself before its `pendingDeliveries` bookkeeping gets deleted,
+    so `statusLabel` can show it directly — `✓ DELIVERED (2 RESENDS)` —
+    right in the UI, no console needed. A message acked on the very first
+    try still shows the plain label; the count only appears once a resend
+    actually happened.
 - **Ack redesign**: the delivery-confirmation ack used to be its own
   binary wire frame (`AckFrame`, mirroring `NackFrame`'s RS-protected
   5-byte header) — but checking the actual CLI-TextOverVoice reference
