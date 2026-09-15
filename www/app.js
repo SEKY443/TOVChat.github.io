@@ -1397,6 +1397,14 @@ function updateLivePreview(mode) {
   if (!preview || preview.text.startsWith(ACK_MARKER)) return; // nothing yet, or a delivery ack -- not a message to preview
   const tag = untagChunk(preview.text);
   if (!tag) return; // envelope (id/username) hasn't fully arrived yet
+  // A resend of a message already fully received once -- the sender
+  // genuinely still needs the ack (handleDecodedFrame re-sends it), but
+  // re-showing its decode in the live box reads as the process
+  // "repeating" for no reason: the user already watched this one resolve.
+  // Leave the box alone entirely for it, at both the preview stage here
+  // and the confirm stage in handleDecodedFrame, so a resend never
+  // disturbs whatever the box is currently doing.
+  if (receivedMessageIds.has(tag.id)) return;
 
   ensureLiveDecodeTracking(tag.id, tag.username);
   clearTimeout(liveDecodeStatusRestoreTimer);
@@ -1430,53 +1438,76 @@ function handleDecodedFrame(frame, mode) {
   // A resend the sender only sent because it never heard our first ack
   // (lost in transit, or just outrun by RETRY_ACK_GRACE_MS) looks
   // identical to a genuinely new message here -- same id, same content,
-  // decoded clean. Used below to skip ringBell/history-duplication for a
-  // duplicate -- but NOT to skip the live-decode box's own completion
-  // (see revealTo's onDone below): the box reflects what's actually being
-  // heard right now, and a resend really did just fully arrive again, so
-  // it announces "complete" and resets on its own schedule regardless of
-  // whether this is old news for the chat history.
+  // decoded clean. The sender genuinely still needs the ack (sent below
+  // regardless), but everything visual -- the live box, the chat bubble,
+  // the bell -- is skipped for a duplicate: the user already watched this
+  // one arrive once, and redoing any of that reads as the process
+  // repeating for no reason.
   const alreadyReceived = result.ok && receivedMessageIds.has(tag.id);
 
   // Fold this frame's now-CONFIRMED (FEC/CRC-verified) text into the live
   // box, correcting anything the raw preview had tentatively gotten wrong
-  // -- see revealTo/updateLivePreview.
-  if (!liveDecodeEl.hidden) {
+  // -- see revealTo/updateLivePreview. Only for a genuinely new message;
+  // see updateLivePreview's matching guard for why a duplicate leaves the
+  // box alone entirely.
+  if (!liveDecodeEl.hidden && !alreadyReceived) {
     ensureLiveDecodeTracking(tag.id, tag.username);
     liveDecodeConfirmed += tag.text;
     clearTimeout(liveDecodeStatusRestoreTimer);
     setLiveDecodeStatus(steadyLiveDecodeStatus());
     if (result.ok) liveDecodeCompleted = true;
-    revealTo(liveDecodeConfirmed, result.ok ? onLiveMessageComplete : undefined);
   }
 
   if (result.ok) {
     dbg("complete", tag.id, alreadyReceived ? "(duplicate resend)" : "(new)", JSON.stringify(result.text.slice(0, 60)));
-    const updated = updateHistoryEntry(tag.id, "rx", {
-      status: "received",
-      text: result.text,
-      username: result.username,
-      framesReceived: result.framesReceived,
-      framesExpected: result.framesExpected,
-    });
-    if (!updated) {
-      addHistoryEntry({
-        id: tag.id,
-        dir: "rx",
-        username: result.username,
-        text: result.text,
-        mode,
-        time: Date.now(),
+
+    // Pushes the finished message into the chat history (and rings the
+    // bell) -- separated out so it can run either right away or, for a
+    // genuinely new message with the live box actually showing it, only
+    // once the box finishes revealing it (see below). Landing the
+    // finished chat bubble in history while the preview box was still
+    // mid-reveal made the real-time decode process look beside the
+    // point -- the "real" answer already sitting right there before the
+    // reveal even caught up to it.
+    const commitToHistory = () => {
+      const updated = updateHistoryEntry(tag.id, "rx", {
         status: "received",
+        text: result.text,
+        username: result.username,
         framesReceived: result.framesReceived,
         framesExpected: result.framesExpected,
       });
+      if (!updated) {
+        addHistoryEntry({
+          id: tag.id,
+          dir: "rx",
+          username: result.username,
+          text: result.text,
+          mode,
+          time: Date.now(),
+          status: "received",
+          framesReceived: result.framesReceived,
+          framesExpected: result.framesExpected,
+        });
+      }
+      if (!alreadyReceived) ringBell();
+    };
+
+    if (!liveDecodeEl.hidden && !alreadyReceived) {
+      revealTo(liveDecodeConfirmed, () => {
+        onLiveMessageComplete();
+        commitToHistory();
+      });
+    } else {
+      commitToHistory();
     }
+
     // Re-send the ack regardless of alreadyReceived (that's the whole
-    // point: the sender is still waiting), but don't re-ring the bell for
-    // something the user already saw arrive once.
+    // point: the sender is still waiting) -- kept immediate regardless of
+    // the chat-bubble sequencing above, since delaying it to match a
+    // multi-second reveal would only hurt real delivery latency for no
+    // benefit to the sender.
     receivedMessageIds.add(tag.id);
-    if (!alreadyReceived) ringBell();
     sendAckFor(tag.id, mode); // fire-and-forget -- see sendAckFor
     // The buffer is never trimmed as it's consumed (only ever grows, up
     // to the hard MAX_BUFFER_SECONDS cap), so without this a long

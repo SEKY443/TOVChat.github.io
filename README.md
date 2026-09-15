@@ -283,6 +283,31 @@ typewriter-key-styled controls.
     correction re-flickers from, resolving into the real text instead of
     silently snapping to it. This is the literal answer to "if it's wrong
     and CRC fixes it, show that too."
+
+    **Found live, two related complaints**: the real-time decode process
+    "sometimes repeats," and the finished chat bubble should only appear
+    *after* the box finishes showing a message, not both at once. Both
+    traced to the same code path. A resend (the sender's ack got lost, so
+    it sent the message again) decodes clean and looks identical to a
+    genuinely new message to `handleDecodedFrame` — before this, that
+    meant the live box re-tracked and re-revealed it from scratch, which
+    reads as the decode process repeating for no real reason: the user
+    already watched this exact message resolve once. Now a resend of an
+    already-fully-received message id leaves the box completely alone, at
+    both the pre-confirmation preview stage (`updateLivePreview`) and the
+    confirmation stage (`handleDecodedFrame`) — the sender still gets its
+    ack, but nothing visual repeats. Separately, the finished chat bubble
+    used to land in history the instant a frame confirmed, regardless of
+    whether the live box's own reveal had actually finished catching up to
+    it yet — so the "real" text was already sitting in history, fully
+    formed, while the preview box was still mid-flicker on the exact same
+    message, making the real-time process look beside the point. For a
+    genuinely new message with the box visible, the chat bubble (and the
+    bell) now wait for the box's own reveal to actually finish — sequenced
+    through `revealTo`'s completion callback — before appearing. The ack
+    itself is sent immediately either way; delaying delivery confirmation
+    to match a multi-second reveal would only hurt real latency for no
+    benefit to the sender.
 - **Ack redesign**: the delivery-confirmation ack used to be its own
   binary wire frame (`AckFrame`, mirroring `NackFrame`'s RS-protected
   5-byte header) — but checking the actual CLI-TextOverVoice reference
