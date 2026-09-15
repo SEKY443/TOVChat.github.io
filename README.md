@@ -381,6 +381,71 @@ typewriter-key-styled controls.
     checking the *entire* raw snapshot log's resolved-prefix length for
     monotonic growth, not a filtered subset.
 
+    **Still happened a FOURTH time, confirmed live yet again — and this
+    one was the actual dominant cause.** Re-running the same corrected
+    (full-log) analysis after the `flickerInChar` fix above still turned
+    up real regressions, just fewer of them. Cross-referencing the exact
+    same window against the console's own `[TOV:reveal-*]`/`[TOV:scan]`
+    lines explained why: `pollCapture` scans every `LISTEN_MODES` entry
+    (`phone` AND `fast_air`) against the *same* raw buffer every poll, and
+    `updateLivePreview` calls `ensureLiveDecodeTracking(tag.id, ...)`
+    unconditionally for whichever mode it's given. Whichever mode isn't
+    the real signal is decoding noise — and `untagChunk` occasionally
+    parses a plausible-looking but bogus tag out of that noise anyway,
+    with a different id. `ensureLiveDecodeTracking` saw that different id
+    and treated it as a genuinely new message, wiping the box back to
+    empty and restarting the reveal — happening on essentially every poll,
+    ping-ponging between the real id and whatever the other mode's noise
+    most recently guessed. This is what the earlier three fixes were each
+    narrowing without eliminating: the token-cancellation and
+    incremental-commit work was all correct and necessary for the races it
+    targeted, but none of it touched THIS path, since this wasn't two
+    reveals racing on the same id — it was the box being handed a
+    different id entirely. Fixed in `updateLivePreview`: a different id is
+    now refused from evicting an already-in-progress, not-yet-completed
+    tracked message that has already shown real content (`liveDecodeId !==
+    null && tag.id !== liveDecodeId && !liveDecodeCompleted &&
+    liveDecodeShown.length > 0`) — a genuinely new message still starts
+    tracking freely (nothing shown yet, or the previous one finished).
+    The authoritative path, `handleDecodedFrame`, is untouched by this
+    guard and always wins once a frame actually confirms (FEC/CRC-
+    verified), so a bogus preview can only ever delay the real message's
+    preview, never replace its eventual confirmed content.
+
+    While investigating this, also chased what looked like a fourth,
+    much stranger bug — the same message id showing up in `[TOV:send]`
+    and `[TOV:complete]` console lines several times, minutes apart, as
+    if the exact same cryptographically-random id had been independently
+    generated and fully resent from scratch repeatedly. Checked directly
+    against the actual DOM (`document.querySelectorAll('.slip').length`
+    on the sender's tab) — exactly 1 send, not several. This was the
+    console-reading tool replaying/duplicating buffered entries, a known
+    unreliability (see the "Debugging" section) — not a real bug. Worth
+    recording as a reminder: cross-check anything console-log-derived
+    that looks astronomically improbable (like a random id repeating)
+    against the actual page state before chasing it further.
+
+    **Requested live**: if receiving stalls partway through (signal lost,
+    a resend that never arrives, or — before the fix just above — a
+    cross-mode false id eviction), the box used to sit frozen showing a
+    half-decoded fragment indefinitely; nothing about `scan_next_frame`'s
+    own, much longer stuck/retry timeout ever touched the on-screen
+    *display*, only the underlying scan attempt. A lightweight watchdog
+    (`checkLiveDecodeStall`, polled every 2s on its own timer, independent
+    of poll cadence) now clears the box back to `AWAITING SIGNAL` and
+    flashes `SIGNAL LOST` if it hasn't moved forward
+    (`liveDecodeLastProgressAt`, touched on every fresh track and every
+    `revealTo` call) in 20 seconds.
+
+    **Requested live**: the outgoing side had no sense of progress either
+    — just a static `TRANSMITTING…` for however long a clip takes (a real
+    phone-mode message can run past 30 seconds). `playPcm` now accepts an
+    optional `onProgress(fraction)` callback, polled against
+    `ctx.currentTime` (not a plain countdown, so it stays accurate even if
+    the tab was throttled or busy) every 150ms for the duration of
+    playback; `sendMessage` and `resendOwnMessage` wire it into the
+    carriage-status line — `● TRANSMITTING… 42%` / `● RESENDING… 42%`.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
@@ -906,10 +971,18 @@ duplicate resend), acks and nacks sent/received
 cycle (`[TOV:retry]`/`[TOV:delivered]`/`[TOV:undelivered]`), collision
 avoidance (`[TOV:carrier-busy]`/`[TOV:carrier-clear]`), the live-decode
 reveal's own timing (`[TOV:reveal-start]`/`[TOV:reveal-done]`/
-`[TOV:reveal-superseded]`), a send (`[TOV:send]`), and a calibrate match
-(`[TOV:calibrate-match]`). Meant to make a real acoustic session
+`[TOV:reveal-superseded]`), the live-decode stall watchdog
+(`[TOV:live-decode-stalled]`), a send (`[TOV:send]`), and a calibrate
+match (`[TOV:calibrate-match]`). Meant to make a real acoustic session
 verifiable from the actual internal state and its timing, not just by
 watching the screen and hoping a screenshot lands at the right moment.
+
+Note: the console-reading tool used to inspect these logs during
+development has been observed replaying/duplicating buffered entries
+across reads, especially spanning a while (see the "reflicker" entry
+above) — before trusting a console-derived pattern that looks
+implausible (the same random id repeating, an event count that doesn't
+match reality), cross-check against actual page/DOM state first.
 
 ## Building locally
 

@@ -111,6 +111,15 @@ const FLICKER_SKIP_THRESHOLD_MS = 16; // below this, no time to show anything bu
 const FLICKER_BITS_ONLY_THRESHOLD_MS = 40; // below this, skip the scrambled-guess phase, go straight to real bits
 const LIVE_DECODE_FLASH_MS = 2500;
 const LIVE_DECODE_COMPLETE_HOLD_MS = 2000;
+// Requested live: if receiving stalls part way through (signal lost, or a
+// resend never comes), the box would otherwise sit frozen showing a
+// half-decoded fragment forever -- nothing about scan_next_frame's own,
+// much longer TRUNCATION_RETRY_TIMEOUT_MS ever clears the DISPLAY, only the
+// underlying scan attempt. Checked by a lightweight watchdog interval, not
+// tied to polling cadence, since a stall is by definition "polling stopped
+// producing anything new."
+const LIVE_DECODE_STALL_TIMEOUT_MS = 20000;
+const LIVE_DECODE_STALL_CHECK_MS = 2000;
 // Per-character flicker duration for newly-arrived (or newly-corrected)
 // live-preview text. Fixed and short -- unlike an earlier version of this
 // box that derived pacing from a whole frame's total over-the-air
@@ -546,6 +555,15 @@ let liveDecodeShown = "";
 let liveDecodeCompleted = false;
 let liveDecodeRevealToken = 0; // bumped to cancel an in-flight reveal when superseded
 let liveDecodeStatusRestoreTimer = null;
+// Wall-clock time (performance.now()) of the last time the box actually
+// moved forward -- a fresh track started, the preview grew, or a real
+// confirmed frame landed. See the stall watchdog below: a transmission can
+// legitimately go quiet for a while (carrier sense, a slow multi-frame
+// gap), but if this box hasn't moved in LIVE_DECODE_STALL_TIMEOUT_MS,
+// whatever it's showing is almost certainly never going to resolve (lost
+// signal, or someone else's noise took the id -- see updateLivePreview's
+// cross-mode guard) and sitting there frozen just confuses the reader.
+let liveDecodeLastProgressAt = 0;
 
 // ============================= rendering =============================
 
@@ -951,7 +969,15 @@ let playbackQueue = Promise.resolve();
 // permitted to transmit.
 const POST_TRANSMISSION_LISTEN_GAP_MS = 2000;
 
-function playPcm(float32Samples, sampleRate) {
+// Requested live: show how far along the CURRENT outgoing transmission is,
+// not just a static "TRANSMITTING..." with no sense of whether it's about
+// to finish or has barely started -- a real phone-mode clip can run past
+// 30 seconds. Polled against ctx.currentTime rather than a plain
+// setTimeout countdown so it stays accurate even if the tab was throttled
+// or busy for a moment.
+const TRANSMIT_PROGRESS_UPDATE_MS = 150;
+
+function playPcm(float32Samples, sampleRate, onProgress) {
   const task = playbackQueue.then(() =>
     waitForClearChannel().then(() => ensureAudioContext()).then((ctx) => {
       return new Promise((resolve) => {
@@ -963,7 +989,20 @@ function playPcm(float32Samples, sampleRate) {
         src.connect(ctx.destination);
         const durationMs = (buffer.length / sampleRate) * 1000;
         suppressCaptureUntil = performance.now() + durationMs + CAPTURE_SUPPRESS_TAIL_S * 1000;
-        src.onended = resolve;
+        let progressTimer = null;
+        if (onProgress) {
+          const startedAt = ctx.currentTime;
+          onProgress(0);
+          progressTimer = setInterval(() => {
+            const fraction = Math.min(1, (ctx.currentTime - startedAt) / (durationMs / 1000));
+            onProgress(fraction);
+          }, TRANSMIT_PROGRESS_UPDATE_MS);
+        }
+        src.onended = () => {
+          if (progressTimer) clearInterval(progressTimer);
+          if (onProgress) onProgress(1);
+          resolve();
+        };
         src.start();
       });
     })
@@ -1045,7 +1084,7 @@ async function sendMessage() {
   sendKey.disabled = true;
   setCarriageStatus("● TRANSMITTING…");
   try {
-    await playPcm(pcm, SR);
+    await playPcm(pcm, SR, (fraction) => setCarriageStatus(`● TRANSMITTING… ${Math.round(fraction * 100)}%`));
   } finally {
     sendKey.disabled = false;
     setCarriageStatus(listening ? "● LISTENING…" : "▢ TYPE YOUR MESSAGE ▢");
@@ -1201,7 +1240,7 @@ async function resendOwnMessage(id) {
   setCarriageStatus("● RESENDING…");
   try {
     const pcm = encode_frames_to_pcm(entry.chunks, entry.mode, undefined, undefined, undefined);
-    await playPcm(pcm, SR);
+    await playPcm(pcm, SR, (fraction) => setCarriageStatus(`● RESENDING… ${Math.round(fraction * 100)}%`));
   } catch (e) {
     setCarriageStatus(`▢ RESEND FAILED: ${e} ▢`);
   } finally {
@@ -1375,7 +1414,23 @@ function ensureLiveDecodeTracking(id, username) {
   liveDecodeShown = "";
   liveDecodeCompleted = false;
   liveDecodeTextEl.textContent = "";
+  liveDecodeLastProgressAt = performance.now();
 }
+
+/// Watchdog: clears the box back to "AWAITING SIGNAL" if whatever it's
+/// showing hasn't moved forward in LIVE_DECODE_STALL_TIMEOUT_MS. Runs on
+/// its own timer rather than from inside pollCapture, since a stalled poll
+/// producing nothing new is exactly the condition this has to detect even
+/// when pollCapture itself is still running fine (a real, ongoing but
+/// stuck-forever scan, not a crashed one).
+function checkLiveDecodeStall() {
+  if (liveDecodeEl.hidden || liveDecodeId === null || liveDecodeCompleted) return;
+  if (performance.now() - liveDecodeLastProgressAt < LIVE_DECODE_STALL_TIMEOUT_MS) return;
+  dbg("live-decode-stalled", liveDecodeId, "no progress for", LIVE_DECODE_STALL_TIMEOUT_MS + "ms");
+  resetLiveDecode();
+  flashLiveDecodeStatus("✕ SIGNAL LOST — AWAITING SIGNAL");
+}
+setInterval(checkLiveDecodeStall, LIVE_DECODE_STALL_CHECK_MS);
 
 /// Animates the live-decode box from whatever it currently shows
 /// (`liveDecodeShown`) to `targetText`, character by character via
@@ -1413,6 +1468,7 @@ async function revealTo(targetText, onDone) {
   ) {
     matchLen++;
   }
+  liveDecodeLastProgressAt = performance.now();
   dbg("reveal-start", "token=" + token, `${matchLen}->${targetText.length} chars`);
   for (let i = matchLen; i < targetText.length; i++) {
     if (token !== liveDecodeRevealToken) {
@@ -1487,6 +1543,27 @@ function updateLivePreview(mode) {
   // and the confirm stage in handleDecodedFrame, so a resend never
   // disturbs whatever the box is currently doing.
   if (receivedMessageIds.has(tag.id)) return;
+
+  // Found live, the REAL dominant cause of "reflicker from the middle" --
+  // pollCapture scans every LISTEN_MODES entry (phone AND fast_air) against
+  // the same raw buffer every poll, and calls this for whichever mode it's
+  // currently looking at. Whichever mode ISN'T the real signal is decoding
+  // noise, and untagChunk occasionally parses a plausible-looking but
+  // bogus tag out of that noise anyway, with a different id. Letting that
+  // evict an already-in-progress tracked message reset the whole box back
+  // to empty and restarted the reveal -- happening on essentially every
+  // poll, ping-ponging between the real id and whatever the other mode's
+  // noise most recently guessed. A genuinely new message still starts
+  // tracking freely (nothing shown yet, or the previous one completed);
+  // only a different id trying to steal an in-progress, not-yet-completed
+  // one that has already shown real content is refused here. The
+  // authoritative path, handleDecodedFrame, is untouched by this and
+  // always wins once a frame actually confirms (FEC/CRC-verified), so a
+  // bogus preview can only ever delay the real message's preview, never
+  // replace its eventual confirmed content.
+  if (liveDecodeId !== null && tag.id !== liveDecodeId && !liveDecodeCompleted && liveDecodeShown.length > 0) {
+    return;
+  }
 
   ensureLiveDecodeTracking(tag.id, tag.username);
   clearTimeout(liveDecodeStatusRestoreTimer);
