@@ -1461,7 +1461,28 @@ function updateLivePreview(mode) {
   clearTimeout(liveDecodeStatusRestoreTimer);
   setLiveDecodeStatus(steadyLiveDecodeStatus());
   const target = liveDecodeConfirmed + tag.text;
-  if (target !== liveDecodeShown) revealTo(target);
+  // Found live: the box sometimes replayed the flicker "starting from
+  // somewhere in the middle" -- not a full restart, a partial one. Cause:
+  // preview_frame re-decodes from scratch every poll, and its guess for
+  // whatever's nearest the growing edge of the buffer (based on the
+  // fewest total samples so far) can shift between polls even for
+  // characters this box had already shown -- not because anything about
+  // the real signal changed, just noise in an inherently-provisional
+  // guess settling differently call to call. Reacting to every such
+  // wobble by re-flickering back into already-shown text made a normal,
+  // expected amount of preview noise look like the whole process kept
+  // randomly restarting. Now the preview is only ever followed FORWARD --
+  // an update is applied only if it's a genuine extension of what's
+  // already shown (same prefix, more appended); if the preview's own
+  // view of an already-shown position wobbles, this poll's update is
+  // just skipped, leaving the display untouched until either a later
+  // preview properly extends it or the real confirmation arrives. The
+  // one correction worth re-flickering for -- the actual FEC/CRC-verified
+  // result differing from what was tentatively shown -- still happens
+  // exactly as before, in handleDecodedFrame, untouched by this.
+  if (target.length > liveDecodeShown.length && target.startsWith(liveDecodeShown)) {
+    revealTo(target);
+  }
 }
 
 function handleDecodedFrame(frame, mode) {

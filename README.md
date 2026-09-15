@@ -309,6 +309,27 @@ typewriter-key-styled controls.
     to match a multi-second reveal would only hurt real latency for no
     benefit to the sender.
 
+    **Found live again, a different kind of repeat**: not the whole box
+    restarting from scratch (the resend case above), but replaying the
+    flicker "starting from somewhere in the middle." Cause: `preview_frame`
+    re-decodes from scratch every poll, and its guess for whatever's
+    nearest the growing edge of the buffer (based on the fewest total
+    samples so far) can shift between polls even for characters the box
+    had already shown — not because the real signal changed, just noise in
+    an inherently-provisional guess settling differently call to call.
+    Reacting to every such wobble by re-flickering back into already-shown
+    text made ordinary, expected preview noise look like the whole process
+    kept randomly restarting partway through. `updateLivePreview` now only
+    ever follows the preview forward: an update applies only if it's a
+    genuine extension of what's already shown (same prefix, strictly more
+    appended); if the preview's own view of an already-shown position
+    wobbles, that poll's update is simply skipped, leaving the display
+    untouched until either a later preview properly extends it or the real
+    confirmation arrives. The one correction actually worth re-flickering
+    for — the real FEC/CRC-verified result differing from what was
+    tentatively shown — still happens exactly as before, in
+    `handleDecodedFrame`, untouched by this change.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
