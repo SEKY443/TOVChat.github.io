@@ -97,17 +97,18 @@ const CALIBRATE_PROBE_GAP_MS = 500; // matches calibrate.rs's inter-probe gap
 // and receive in this file did -- CALIBRATE_CANDIDATES above already
 // establishes, and exercises live, that 20 and 40 are meaningfully more
 // robust than the bare default, just never applied outside calibration.
-// Doubling it to 20 (~10 correctable byte errors per RS block, up from
-// ~5) trades some payload density for real robustness against exactly the
-// noisy-channel case being reported -- 40 was available too but costs
-// proportionally more of each frame's wire budget for a channel that
-// isn't calibrated to need it. Sender and receiver MUST agree on this
-// value -- it changes the wire layout, not just error tolerance -- so it
-// has to be applied identically everywhere a plain (non-calibrate) send
-// or scan happens; a stale cached client still using the old default will
-// fail to decode a new-default sender's frames and vice versa until it
-// reloads, same as any other wire-format change here.
-const PARITY_BYTES = 20;
+//
+// Briefly doubled to 20 -- reverted, requested live: more parity bytes
+// means a larger frame, which directly costs transmission time, and that
+// tradeoff wasn't worth it here. Left explicit (rather than just removing
+// the argument and letting it default) so intent stays visible, but back
+// at the library's own DEFAULT_PARITY_BYTES value. The other, independent
+// fixes made investigating this -- normalizePeak's windowing, and the
+// preview no longer restarting on a repeated-but-still-failing resend --
+// stay in place; they were never about this value. CALIBRATE remains the
+// tool for finding whether a specific real channel actually needs more
+// than this.
+const PARITY_BYTES = 10;
 
 // Exact strings protocol::parse_frame's ParseResult::fail/fail_with use
 // (see textovervoice-core's protocol.rs) for a frame that genuinely made

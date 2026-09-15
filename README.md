@@ -599,6 +599,32 @@ typewriter-key-styled controls.
     confirm in the first place, which is a real channel/audio-quality
     question CALIBRATE is the tool for, not this box.
 
+    A follow-up asked whether the two-region protection (separately-
+    protected header + payload CRC, see protocol.rs's own extensive doc
+    comment on why it replaced a single-layer format) could be simplified
+    back to one layer, on the theory that fewer protected regions would be
+    more forgiving. Looked into it rather than just implementing it: the
+    crate's own measured history says the opposite — the single-layer
+    format's header carried zero redundancy, and real fuzz testing found a
+    single corrupted marker byte made a whole frame unparseable regardless
+    of payload FEC strength, plus ~7% of trials silently reported *wrong*
+    header fields (message id included) with no error raised at all. The
+    two-layer format is what fixed both, specifically. Reverting would
+    likely make exactly the "long message won't decode" failures worse,
+    not better, so this was explained rather than implemented.
+
+    **Requested live, immediately after**: decode had gotten slower.
+    `PARITY_BYTES` reverted from 20 back to the library's own default (10)
+    — more parity bytes directly costs transmission time (a larger frame),
+    and that tradeoff wasn't worth it here. Still explicit rather than
+    just omitting the argument, so the intent stays visible in the code.
+    The other two fixes made while investigating the original "stuck with
+    the correct msg" report — `normalizePeak`'s windowing, and the preview
+    no longer restarting from scratch on a repeated-but-still-failing
+    resend — are independent of this value and stay in place. CALIBRATE
+    remains the tool for finding whether a specific real channel actually
+    needs more than the default.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history
