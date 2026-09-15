@@ -525,6 +525,29 @@ typewriter-key-styled controls.
     actually gets sent) — only the sender's own status line shows
     `● TRANSMITTING PART 2/3… 42%` while it's happening.
 
+    **Requested live**: real-world decode accuracy over an actual acoustic
+    channel (room noise, phone speaker/mic quality, distance) needed to be
+    better — messages weren't decoding reliably at all for some listeners.
+    `encode_frames_to_pcm`/`scan_next_frame`/`preview_frame` all take an
+    optional `parity_bytes` (Reed-Solomon redundancy per RS block, see
+    textovervoice-core's `fec.rs`), defaulting to the library's own
+    `DEFAULT_PARITY_BYTES` (10) whenever omitted — which every ordinary
+    send and receive in this file did. `CALIBRATE_CANDIDATES` already
+    established, and exercises live, that 20 and 40 are meaningfully more
+    robust than the bare default; that was never applied outside
+    calibration itself. New `PARITY_BYTES = 20` constant, threaded through
+    every ordinary (non-calibrate) encode and scan call site — doubling
+    the correctable-byte-errors-per-RS-block budget (~10, up from ~5) in
+    exchange for a modestly larger frame. Sender and receiver have to
+    agree on this value (it changes the wire layout, not just error
+    tolerance), so it went into every plain send/scan site identically;
+    the two `CALIBRATE_CANDIDATES` call sites are untouched, since they
+    intentionally vary it to test multiple settings against the real
+    channel. **This changes the wire format** — same caveat as every other
+    wire-format change here: a stale cached client still on the old
+    default can't talk to a client on the new one (and vice versa) until
+    it hard-reloads.
+
     **Requested live**: the resend count behind a `✓ DELIVERED` was only
     ever visible in the debug console (`[TOV:delivered] id after N
     resend(s)`). `markDelivered` now carries that count into the history

@@ -88,6 +88,27 @@ const CALIBRATE_CANDIDATES = [
 ];
 const CALIBRATE_PROBE_GAP_MS = 500; // matches calibrate.rs's inter-probe gap
 
+// Requested live: real-world decode accuracy over an actual acoustic
+// channel (room noise, phone speaker/mic quality, distance) needed to be
+// better. `encode_frames_to_pcm`/`scan_next_frame`/`preview_frame` all
+// take an optional `parity_bytes` (Reed-Solomon redundancy per RS block --
+// see textovervoice-core's fec.rs), defaulting to the library's own
+// DEFAULT_PARITY_BYTES (10) whenever omitted, which every ordinary send
+// and receive in this file did -- CALIBRATE_CANDIDATES above already
+// establishes, and exercises live, that 20 and 40 are meaningfully more
+// robust than the bare default, just never applied outside calibration.
+// Doubling it to 20 (~10 correctable byte errors per RS block, up from
+// ~5) trades some payload density for real robustness against exactly the
+// noisy-channel case being reported -- 40 was available too but costs
+// proportionally more of each frame's wire budget for a channel that
+// isn't calibrated to need it. Sender and receiver MUST agree on this
+// value -- it changes the wire layout, not just error tolerance -- so it
+// has to be applied identically everywhere a plain (non-calibrate) send
+// or scan happens; a stale cached client still using the old default will
+// fail to decode a new-default sender's frames and vice versa until it
+// reloads, same as any other wire-format change here.
+const PARITY_BYTES = 20;
+
 // Exact strings protocol::parse_frame's ParseResult::fail/fail_with use
 // (see textovervoice-core's protocol.rs) for a frame that genuinely made
 // it far enough to be a real (if corrupted) data-frame attempt -- as
@@ -1119,7 +1140,7 @@ async function sendOneMessage(raw, part) {
 
   let pcm;
   try {
-    pcm = encode_frames_to_pcm(taggedChunks, selectedMode, undefined, undefined, undefined);
+    pcm = encode_frames_to_pcm(taggedChunks, selectedMode, undefined, undefined, undefined, PARITY_BYTES);
   } catch (e) {
     setCarriageStatus(`▢ ENCODE FAILED: ${e} ▢`);
     return;
@@ -1213,7 +1234,7 @@ async function attemptDeliveryRetry(id) {
   dbg("retry", id, `attempt ${pending.attempt}/${maxRetries}`, "-- no ack within", currentDeliveryGraceMs(pending.attempt - 1) + "ms", "(" + pendingDeliveries.size + " pending)");
   updateHistoryEntry(id, "tx", { status: "resending", attempt: pending.attempt });
   try {
-    const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined);
+    const pcm = encode_frames_to_pcm(pending.chunks, pending.mode, undefined, undefined, undefined, PARITY_BYTES);
     await playPcm(pcm, SR);
   } catch {
     // A transient encode/playback failure shouldn't silently end the retry
@@ -1283,7 +1304,7 @@ function stopDeliveryRetry(id) {
 async function sendAckFor(id, mode) {
   dbg("ack-sent", id, mode);
   try {
-    const pcm = encode_frames_to_pcm([ACK_MARKER + id], mode, undefined, undefined, undefined);
+    const pcm = encode_frames_to_pcm([ACK_MARKER + id], mode, undefined, undefined, undefined, PARITY_BYTES);
     await playPcm(pcm, SR);
   } catch (e) {
     dbg("ack-sent-failed", id, e);
@@ -1296,7 +1317,7 @@ async function resendOwnMessage(id) {
   sendKey.disabled = true;
   setCarriageStatus("● RESENDING…");
   try {
-    const pcm = encode_frames_to_pcm(entry.chunks, entry.mode, undefined, undefined, undefined);
+    const pcm = encode_frames_to_pcm(entry.chunks, entry.mode, undefined, undefined, undefined, PARITY_BYTES);
     await playPcm(pcm, SR, (fraction) => setCarriageStatus(`● RESENDING… ${Math.round(fraction * 100)}%`));
   } catch (e) {
     setCarriageStatus(`▢ RESEND FAILED: ${e} ▢`);
@@ -1598,7 +1619,7 @@ function updateLivePreview(mode) {
   if (liveDecodeId !== null && !liveDecodeCompleted && mode !== liveDecodeMode) return;
   let preview;
   try {
-    preview = preview_frame(captureBuffer.subarray(0, captureLength), captureSampleRate, mode, scanPos[mode], undefined);
+    preview = preview_frame(captureBuffer.subarray(0, captureLength), captureSampleRate, mode, scanPos[mode], PARITY_BYTES);
   } catch {
     return;
   }
@@ -1841,7 +1862,7 @@ async function pollCapture(buffer) {
     while (true) {
       let frame;
       try {
-        frame = scan_next_frame(buffer, captureSampleRate, mode, pos);
+        frame = scan_next_frame(buffer, captureSampleRate, mode, pos, PARITY_BYTES);
       } catch {
         break;
       }
@@ -2279,7 +2300,7 @@ fileInput.addEventListener("change", async (ev) => {
     while (true) {
       let frame;
       try {
-        frame = scan_next_frame(samples, audioBuffer.sampleRate, mode, pos);
+        frame = scan_next_frame(samples, audioBuffer.sampleRate, mode, pos, PARITY_BYTES);
       } catch {
         break;
       }
