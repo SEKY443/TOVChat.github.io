@@ -151,9 +151,16 @@ const SQUELCH_FAST_ALPHA = 0.3;
 const SQUELCH_FLOOR_ALPHA = 0.01;
 const SQUELCH_BUSY_MULTIPLIER = 4.0;
 const SQUELCH_MIN_FLOOR = 0.0005; // absolute floor so a near-silent source doesn't call every nonzero signal "busy"
+// How many initial readings get folded into the floor unconditionally
+// (bypassing the normal busy-gate) before switching to steady-state
+// behavior -- see squelchUpdate. One sample is too noisy to trust as an
+// entire ambient calibration (a single ~10-20ms chunk can easily be
+// anomalously quiet or loud by pure chance); averaging a real stretch of
+// them gives a floor that actually represents the room.
+const SQUELCH_BOOTSTRAP_SAMPLES = 20;
 let squelchFast = 0;
 let squelchFloor = 0;
-let squelchSeeded = false; // see squelchUpdate's first-call bootstrap
+let squelchBootstrapCount = 0; // see squelchUpdate's bootstrap phase
 
 /// Found live: this ported the CLI's Squelch::update faithfully, but the
 /// port (and, on inspection, the reference it was ported from) has a real
@@ -172,19 +179,42 @@ let squelchSeeded = false; // see squelchUpdate's first-call bootstrap
 /// name only. Reproduced directly: feeding a steady, realistic ambient
 /// RMS of 0.01 (-40dBFS, an ordinary quiet room) through the unmodified
 /// port leaves the floor at exactly 0 and `is_busy()` permanently true
-/// after 300 updates. Fixed by seeding the floor directly from the first
-/// real reading (bypassing the gate for just that one sample, since there
-/// is no prior floor estimate yet to protect) -- every reading after that
-/// uses the normal gated EMA, unchanged.
+/// after 300 updates.
+///
+/// First fix seeded the floor from just the very first reading. Still not
+/// robust enough, found live again: a single ~10-20ms chunk is a noisy
+/// sample of a real room -- if it happens to land during an anomalously
+/// quiet instant, the floor seeds too low, and then perfectly ordinary
+/// ambient fluctuation routinely reads 4x above it, right back to
+/// "busy" most of the time, just less absolutely permanent than the
+/// original zero-forever deadlock.
+///
+/// Second attempt folded the first SQUELCH_BOOTSTRAP_SAMPLES readings into
+/// the floor unconditionally via the SAME slow EMA (SQUELCH_FLOOR_ALPHA =
+/// 0.01) steady-state uses -- still wrong, caught by simulation before
+/// this ever reached a real device: that alpha is deliberately slow so a
+/// real transmission can't drag the floor up mid-message, which means it
+/// ALSO barely moves within only 20 samples -- floor ends up nowhere near
+/// the true ambient level, right back to "busy" almost all the time, just
+/// with a nonzero floor instead of zero.
+///
+/// Now the bootstrap phase uses a true running mean (converges to the
+/// exact average of the first SQUELCH_BOOTSTRAP_SAMPLES readings, not an
+/// exponentially slow crawl toward it) -- fast, honest calibration for the
+/// one-time "what does this room actually sound like" question -- and
+/// only switches to the slow gated EMA once that's established, for
+/// exactly the reason the slow alpha exists in steady state. Verified
+/// with simulation: correct (not busy) for steady ambient, noisy/bursty
+/// ambient (random 0.005-0.02 RMS), and an anomalous first sample: a real
+/// burst is still correctly detected, and it recovers cleanly afterward.
 function squelchUpdate(rms) {
   if (!Number.isFinite(rms)) return; // guard against a pathological driver producing NaN/Infinity, same as the CLI's Squelch::update
-  if (!squelchSeeded) {
-    squelchFast = rms;
-    squelchFloor = rms;
-    squelchSeeded = true;
+  squelchFast = SQUELCH_FAST_ALPHA * rms + (1 - SQUELCH_FAST_ALPHA) * squelchFast;
+  if (squelchBootstrapCount < SQUELCH_BOOTSTRAP_SAMPLES) {
+    squelchBootstrapCount++;
+    squelchFloor += (squelchFast - squelchFloor) / squelchBootstrapCount; // true running mean
     return;
   }
-  squelchFast = SQUELCH_FAST_ALPHA * rms + (1 - SQUELCH_FAST_ALPHA) * squelchFast;
   const effectiveFloor = Math.max(squelchFloor, SQUELCH_MIN_FLOOR);
   if (squelchFast < effectiveFloor * SQUELCH_BUSY_MULTIPLIER) {
     squelchFloor = SQUELCH_FLOOR_ALPHA * squelchFast + (1 - SQUELCH_FLOOR_ALPHA) * squelchFloor;
@@ -192,13 +222,19 @@ function squelchUpdate(rms) {
 }
 
 function squelchIsBusy() {
+  // Still bootstrapping (see squelchUpdate): no trustworthy floor yet, so
+  // there's nothing meaningful to compare against -- assume clear rather
+  // than busy, since the alternative (stuck reporting busy from a floor
+  // that's still exactly 0 right after LISTEN turns on) is the ORIGINAL
+  // deadlock this whole fix exists to avoid.
+  if (squelchBootstrapCount < SQUELCH_BOOTSTRAP_SAMPLES) return false;
   return squelchFast > Math.max(squelchFloor, SQUELCH_MIN_FLOOR) * SQUELCH_BUSY_MULTIPLIER;
 }
 
 function squelchReset() {
   squelchFast = 0;
   squelchFloor = 0;
-  squelchSeeded = false;
+  squelchBootstrapCount = 0;
 }
 
 const CARRIER_SENSE_POLL_MS = 250; // base interval between busy re-checks
@@ -1489,12 +1525,20 @@ async function waitForClearChannel() {
   const previousStatus = carriageStatus.textContent;
   const deadline = performance.now() + CARRIER_SENSE_MAX_WAIT_MS;
   let waited = 0;
-  let announcedBusy = false;
+  let lastLoggedAt = 0;
   while (performance.now() < deadline) {
     if (squelchIsBusy()) {
-      if (!announcedBusy) {
-        dbg("carrier-busy", "fast=" + squelchFast.toFixed(4), "floor=" + squelchFloor.toFixed(4), "waiting before transmit");
-        announcedBusy = true;
+      // Logged periodically (not just once) so a real session's console
+      // shows a time series of fast/floor while stuck waiting -- a single
+      // snapshot from the first busy check can't tell "genuinely busy the
+      // whole time" apart from "briefly busy, then stuck reporting busy
+      // for an unrelated reason" (still calibrating, a squelch bug, real
+      // sustained loud ambient noise, etc.) -- exactly the question that
+      // needs answering when this wait is running out its full length
+      // instead of clearing quickly the way a real quiet gap should let it.
+      if (performance.now() - lastLoggedAt > 1000) {
+        dbg("carrier-busy", "fast=" + squelchFast.toFixed(4), "floor=" + squelchFloor.toFixed(4), "threshold=" + (Math.max(squelchFloor, SQUELCH_MIN_FLOOR) * SQUELCH_BUSY_MULTIPLIER).toFixed(4), "waited=" + Math.round(waited) + "ms");
+        lastLoggedAt = performance.now();
       }
       setCarriageStatus("● CHANNEL BUSY, WAITING…");
       const backoff = CARRIER_SENSE_POLL_MS + Math.random() * CARRIER_SENSE_POLL_MS;

@@ -450,6 +450,41 @@ typewriter-key-styled controls.
     transmission legitimately take" reasoning `TRUNCATION_RETRY_TIMEOUT_MS`
     below already uses.
 
+    **Found live yet again — the squelch's calibration itself was still
+    wrong, twice over.** With a 60s ceiling now in place to catch a
+    genuinely stuck reading, a *stuck* reading became visible for what it
+    was: the channel reading busy almost continuously, acks essentially
+    never actually getting sent. Two compounding bugs, both caught by
+    simulation before touching a real device again:
+    1. The first bootstrap fix seeded the floor from just the *one* very
+       first reading. A single ~10–20ms chunk is a noisy sample of a real
+       room — if it happens to land during an anomalously quiet instant,
+       the floor seeds too low, and ordinary ambient fluctuation
+       afterward routinely reads 4x above it: "busy" most of the time,
+       just not absolutely permanently anymore.
+    2. The next attempt averaged the first 20 readings into the floor
+       instead — but used the same slow `SQUELCH_FLOOR_ALPHA` (0.01)
+       steady-state relies on, which is deliberately slow so a real
+       transmission can't drag the floor up mid-message. That same
+       slowness means it barely moves within only 20 samples either —
+       floor ends up nowhere near the true ambient level, right back to
+       "busy" almost always, just with a nonzero floor instead of zero.
+
+    Fixed by giving the bootstrap phase its own true running mean (exact
+    average of the first 20 readings, not an exponentially slow crawl
+    toward it) for the one-time "what does this room actually sound like"
+    question, only switching to the slow gated EMA once that's
+    established. Verified with simulation across steady ambient, noisy/
+    bursty ambient (random 0.005–0.02 RMS, standing in for real-world
+    AGC jitter), and an anomalous first sample — all correctly read
+    clear; a real burst is still correctly detected busy, and recovers
+    cleanly once it ends. Also added periodic (not one-shot) busy-state
+    logging (`[TOV:carrier-busy]`, every ~1s while waiting) so a real
+    session's console shows a time series of fast/floor/threshold instead
+    of a single snapshot from the moment the wait started — the fast/
+    floor/threshold numbers a next report like this needs, without
+    another guess-and-redeploy cycle.
+
     **Found live with a third device**: even with the jitter fix above,
     testing with three tabs (one sender, two receivers both decoding the
     same broadcast) still occasionally triggered an unneeded resend.
